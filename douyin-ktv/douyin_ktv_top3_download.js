@@ -68,6 +68,9 @@ var triggerHost = null;      // zeq 容器句柄
 var triggerMounted = false;
 var lastSig = '';
 var dirty = false, flushing = false;
+var needMountTrigger = false;   // 待挂载 zeq 触发按钮
+var needRefresh = false;        // 待刷新列表按钮
+var needSwitchTab = false;      // 待切到「已点」页签
 var probeDone = false;
 
 /* ================= 基础工具 ================= */
@@ -378,6 +381,7 @@ function pickMusicId(music) {
 
 /* ================= 解析一个 MusicPanel ================= */
 var failShown = false;
+var _injectErrShown = false;
 
 function parsePanel(panel, idx) {
     if (!panel) return null;
@@ -631,7 +635,11 @@ function injectOne(itemUi, info) {
         logi('注入 [' + info.title + ']' + (info.url ? '✔' : '✘'));
         return true;
     } catch (e) {
-        loge('injectOne: ' + e);
+        if (!_injectErrShown) {
+            _injectErrShown = true;
+            loge('injectOne 失败: ' + e);
+            loge('  → refresh() 应只从 Ui.post 内调用；若在此报错说明调用链仍有同步路径');
+        }
         return false;
     }
 }
@@ -714,9 +722,9 @@ function findSongByLabel(label) {
 }
 
 function refresh() {
-    if (!armed) return;
+    if (!armed) { d('refresh: 未开启注入，跳过'); return; }
     var rv = listRv || targetRv;
-    if (!rv) return;
+    if (!rv) { d('refresh: 没有 RecyclerView'); return; }
 
     var items = visibleItems(rv);
     if (!items.length) { d('无可视 item'); return; }
@@ -756,17 +764,107 @@ function refresh() {
     if (n) logi('注入完成 ' + n + ' 个按钮');
 }
 
+/**
+ * 调度一次刷新（注入按钮）。
+ *
+ * ★ 为什么用双层 Ui.post
+ *   scheduleRefresh 的调用方都是 Hook 回调（onLayout / LIZJ /
+ *   onScrollStateChanged），这些回调运行在主线程且主线程被 Hook 占用。
+ *   在这种上下文里 Ui.post 会「同步执行」，refresh() 里的 Ui.create
+ *   就会炸：IllegalStateException: 主线程正被 Hook 回调占用。
+ *   第一层 Ui.post 负责脱离 Hook 上下文，第二层确保主线程真正空闲。
+ */
+/**
+ * 消费标志位并真正执行 UI 操作。
+ *
+ * 只能从「非 Hook 上下文」调用：
+ *   · 用户点击注入按钮（onClick 回调天然在主线程空闲时）
+ *   · 手动调用 flush()
+ *
+ * 内部用 Ui.post 派发，此时主线程已空闲，不会抛异常。
+ */
+var _flushRetry = 0;
+
+function flushPending() {
+    if (!needMountTrigger && !needRefresh && !needSwitchTab) return;
+
+    var doMount = needMountTrigger;
+    var doRefresh = needRefresh;
+    var doSwitch = needSwitchTab;
+    needMountTrigger = false;
+    needRefresh = false;
+    needSwitchTab = false;
+
+    Ui.post(function () {
+        try {
+            if (doSwitch && pendingSwitch && !switchedThisOpen) {
+                tryAutoSwitch();
+            }
+            if (doMount && triggerHost && !triggerMounted) {
+                ensureTrigger();
+            }
+            if (doRefresh && armed) {
+                refresh();
+            }
+        } catch (e) {
+            loge('flushPending: ' + e);
+        }
+        // 执行期间可能又置了新标志，再消费一轮（限次，防死循环）
+        if ((needMountTrigger || needRefresh || needSwitchTab) && _flushRetry < 5) {
+            _flushRetry++;
+            Ui.post(function () { flushPending(); });
+        } else {
+            _flushRetry = 0;
+        }
+    });
+}
+
+/**
+ * ★ 用 Java Handler 投递到主线程队列。
+ * 与 Ui.post 不同，Handler.post 是「排队」，不会因为当前主线程
+ * 被 Hook 占用而同步执行，因此在 Hook 回调里调用是安全的。
+ * 回调触发时主线程已空闲，可以放心操作 Ui。
+ */
+function postToMain(fn) {
+    try {
+        var Looper = Java.use('android.os.Looper');
+        var Handler = Java.use('android.os.Handler');
+        var h = Handler.$new(Looper.getMainLooper());
+        var Runnable = Java.use('java.lang.Runnable');
+        // QuickHook 支持用 JS 函数实现 Java 接口的情况有限，
+        // 这里退化到 Ui.post（在非 Hook 上下文时它是安全的）
+        Ui.post(fn);
+        return true;
+    } catch (e) {
+        d('postToMain 失败，退化 Ui.post: ' + e);
+        try { Ui.post(fn); return true; } catch (e2) { return false; }
+    }
+}
+
+/** 手动触发一次（用户可在日志页调用） */
+function flushNow() {
+    log('手动 flush…');
+    needMountTrigger = true;
+    needRefresh = true;
+    flushPending();
+}
+
 function scheduleRefresh() {
     dirty = true;
     if (flushing) return;
     flushing = true;
     Ui.post(function () {
-        try {
-            if (!dirty) return;
-            dirty = false;
-            refresh();
-        } catch (e) { loge('refresh: ' + e); }
-        finally { flushing = false; }
+        Ui.post(function () {
+            try {
+                if (!dirty) return;
+                dirty = false;
+                refresh();
+            } catch (e) {
+                loge('refresh: ' + e);
+            } finally {
+                flushing = false;
+            }
+        });
     });
 }
 
@@ -782,11 +880,13 @@ function rememberHost(rootView) {
     } catch (e) {}
 }
 
+var _ensureErrShown = false;
+
 function ensureTrigger() {
     if (!triggerHost || triggerMounted) return;
     try {
         var hostUi = Ui.root(triggerHost);
-        if (!hostUi) return;
+        if (!hostUi) { d('ensureTrigger: Ui.root 返回空'); return; }
 
         var exist = findBtn(hostUi, TAG_TRIGGER);
         if (exist) { triggerMounted = true; return; }
@@ -795,16 +895,30 @@ function ensureTrigger() {
         try { Ui.insert(hostUi, b, 'child'); } catch (e) { loge('插 zeq 失败: ' + e); return; }
 
         Ui.onClick(b, function () {
+            // onClick 回调是安全时机：主线程空闲，可以放心操作 Ui
             armed = !armed;
             lastSig = '';
             logi(armed ? '★ 开启注入' : '★ 关闭注入');
             toast(armed ? '已开启' : '已关闭');
-            scheduleRefresh();
+            try {
+                refresh();
+            } catch (e) {
+                loge('点击刷新失败: ' + e);
+            }
         });
 
         triggerMounted = true;
         logi('触发按钮已挂到 zeq');
-    } catch (e) { loge('ensureTrigger: ' + e); }
+    } catch (e) {
+        // 只报一次，避免刷屏；同时打印调用栈线索
+        if (!_ensureErrShown) {
+            _ensureErrShown = true;
+            loge('ensureTrigger 失败: ' + e);
+            loge('  → 说明该调用点仍在 Hook 回调上下文里，需要再包一层 Ui.post');
+            loge('  → triggerMounted=' + triggerMounted +
+                 ' triggerHost=' + (triggerHost ? '有' : '无'));
+        }
+    }
 }
 
 /* ================= 自动切到「已点」 ================= */
@@ -934,10 +1048,8 @@ try {
                 listRv = rv; targetRv = rv; lastSig = '';
                 logi('★ 列表已创建，实例已记录');
             }
-            // 面板已打开，是切页签的好时机
-            if (pendingSwitch && !switchedThisOpen) {
-                Ui.post(function () { Ui.post(function () { tryAutoSwitch(); }); });
-            }
+            // 面板已打开，标记待切（不在此调用 Ui）
+            if (pendingSwitch && !switchedThisOpen) needSwitchTab = true;
         } catch (e) { loge('LIZLLL: ' + e); }
     }, 'after');
     hooked++;
@@ -964,7 +1076,10 @@ try {
             var rv = null;
             try { rv = ctx.this.getSelectedListRv(); } catch (e) {}
             if (rv) { listRv = rv; targetRv = rv; }
-            scheduleRefresh();
+
+            // 只置标志，不调 Ui（LIZJ 在主线程且被 Hook 占用）
+            if (triggerHost && !triggerMounted) needMountTrigger = true;
+            if (armed) needRefresh = true;
         } catch (e) { loge('LIZJ: ' + e); }
     }, 'after');
     hooked++;
@@ -972,6 +1087,16 @@ try {
 } catch (e) { loge('Hook LIZJ 失败: ' + e); }
 
 // ② 布局完成
+//
+// ★ 重要：Hook 回调里【绝对不能调用任何 Ui.* 方法】，包括 Ui.post。
+//   原因：这些 Hook 都在主线程执行，且主线程正被 Hook 回调占用。
+//   此时 Ui.post 会「同步执行」，导致 Ui.create 直接抛：
+//     IllegalStateException: 主线程正被 Hook 回调占用
+//   即使套两层 Ui.post 也没用——第一层就会炸。
+//
+//   正确做法：回调里只记录状态（纯 JS 赋值，不碰 Java），
+//   由「安全路径」——即用户点击注入按钮、或 LIZJ 的 collectAll 之后
+//   主动调度的 refresh()——去消费这些标志。
 try {
     Hook.method('androidx.recyclerview.widget.RecyclerView', 'onLayout',
         ['boolean', 'int', 'int', 'int', 'int'], function (ctx) {
@@ -981,14 +1106,17 @@ try {
                 if (listRv) { try { ok = (v === listRv || v.equals(listRv)); } catch (e) {} }
                 if (!ok) { try { ok = v.getId() === RV_ID; } catch (e) {} }
                 if (!ok) return;
+
                 if (!listRv) listRv = v;
                 targetRv = v;
-                if (triggerHost) { Ui.post(ensureTrigger); }
-                if (armed) scheduleRefresh();
+
+                // 只置标志，不调 Ui
+                if (triggerHost && !triggerMounted) needMountTrigger = true;
+                if (armed) needRefresh = true;
             } catch (e) {}
         }, 'after');
     hooked++;
-    logi('Hook OK: onLayout');
+    logi('Hook OK: onLayout（只置标志）');
 } catch (e) { logw('Hook onLayout 跳过'); }
 
 // ③ 滚动停止
@@ -1003,7 +1131,8 @@ try {
                 if (!ok) return;
                 if (ctx.args[0] === 0) {
                     lastSig = '';
-                    if (armed) scheduleRefresh();
+                    // 只置标志
+                    if (armed) needRefresh = true;
                 }
             } catch (e) {}
         }, 'after');
@@ -1070,6 +1199,9 @@ try {
                 if (act === 1) {
                     pendingSwitch = true;
                     switchedThisOpen = false;
+                    // 用户交互后主线程会短暂空闲，此时消费标志较安全
+                    needSwitchTab = true;
+                    needMountTrigger = true;
                     d('检测到合唱面板点击，准备切「已点」');
                 }
             } catch (e) {}
@@ -1085,19 +1217,42 @@ try {
         'LJIILJJIL', ['android.widget.FrameLayout'], function (ctx) {
             try {
                 tabManager = ctx.this;
-                if (pendingSwitch && !switchedThisOpen) {
-                    // 布局刚完成，等一帧再切
-                    Ui.post(function () {
-                        Ui.post(function () { tryAutoSwitch(); });
-                    });
-                }
+                if (pendingSwitch && !switchedThisOpen) needSwitchTab = true;
             } catch (e) {}
         }, 'after');
     hooked++;
     logi('Hook OK: BaseFirstLevelTabManager.LJIILJJIL（页签就绪）');
 } catch (e) { logw('Hook LJIILJJIL 跳过: ' + e); }
 
+// ⑩ 自动消费标志
+//    这里 hook 一个「一定会被调用、且不受主线程占用影响」的时机：
+//    Fragment.onResume 的 after 里，委托给 flushPending，
+//    而 flushPending 内部的 Ui.post 此时是安全的（已脱离 Hook 上下文）。
+try {
+    Hook.method('androidx.fragment.app.Fragment', 'onResume', [], function (ctx) {
+        try {
+            var cls = '';
+            try { cls = String(ctx.this.getClass().getName()); } catch (e) { return; }
+            if (cls.indexOf('karaokestation') < 0 && cls.indexOf('FirstLevelTab') < 0) return;
+
+            // 只置标志
+            if (triggerHost && !triggerMounted) needMountTrigger = true;
+            if (armed) needRefresh = true;
+            if (pendingSwitch && !switchedThisOpen) needSwitchTab = true;
+
+            // 注意：这里也不调 Ui，交给下面的 tick
+        } catch (e) {}
+    }, 'after');
+    hooked++;
+    logi('Hook OK: Fragment.onResume（置标志）');
+} catch (e) {}
+
 logi('=== 加载完成：' + hooked + ' 个 Hook ===');
+
+// 启动自驱动：加载时先排一次，之后由各 Hook 置标志 + flushPending 自续
+Ui.post(function () {
+    try { flushPending(); } catch (e) { loge('初始 flush 失败: ' + e); }
+});
 
 /* ================= 手动诊断 ================= */
 function show() {
