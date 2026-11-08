@@ -17,6 +17,15 @@
 
 var CFG = {
     debug: true,
+    /**
+     * ★ 运行模式
+     *   'prod'  正常功能：注入按钮 + 下载
+     *   'probe' 只诊断：打印列表元素结构，不碰 UI、不下载
+     *
+     * 排查阶段设 'probe'；确认结构后改回 'prod'。
+     * probe 模式在第一次成功拿到列表后自动解除 Hook。
+     */
+    mode: 'probe',
 
     maxRows: 3,                 // 只处理前 3 首（adapterPosition 0/1/2）
     threads: 6,                 // 多线程分块下载（API 上限 8）
@@ -112,6 +121,202 @@ function listGet(lst, i) {
     try { if (lst.get) return lst.get(i); } catch (e) {}
     try { return lst[i]; } catch (e) {}
     return null;
+}
+
+/* ================= 诊断（probe 模式 & 手动调用） ================= */
+
+/** 安全取类名 */
+function typeNameOf(o) {
+    if (!o) return 'null';
+    try { var t = o.$type; if (t) return String(t); } catch (e) {}
+    try { var t2 = o.getClass().getName(); if (t2) return String(t2); } catch (e) {}
+    return typeof o;
+}
+
+/** 安全 toString（截断） */
+function strOf(o, max) {
+    if (o === null || o === undefined) return String(o);
+    max = max || 300;
+    try { var s = o.$str(); if (s) return String(s).slice(0, max); } catch (e) {}
+    try { return String(o).slice(0, max); } catch (e) {}
+    return '(无法 toString)';
+}
+
+/**
+ * 解析 $fields() 为字段名数组。
+ * 格式是 "类型 名字"，类型可能含空格，所以按空白切后取最后一段。
+ */
+function fieldNamesOf(obj) {
+    var out = [];
+    try {
+        var fs = obj.$fields();
+        var n = (fs && fs.length) ? fs.length : 0;
+        for (var i = 0; i < n; i++) {
+            var raw = String(fs[i]);
+            var parts = raw.split(/\s+/);
+            out.push(parts[parts.length - 1] || raw);
+        }
+    } catch (e) {
+        log('  $fields 失败: ' + e);
+    }
+    return out;
+}
+
+/**
+ * 探测单个列表元素。
+ * 只做诊断，不修改任何东西。
+ */
+function probeElement(el, tag) {
+    log('');
+    log('════════ ' + tag + ' ════════');
+    if (!el) { logw('元素为 null'); return; }
+
+    log('真实类型: ' + typeNameOf(el));
+    log('toString: ' + strOf(el, 400));
+
+    // 字段列表
+    var names = fieldNamesOf(el);
+    log('字段数: ' + names.length);
+    if (names.length) log('字段名: ' + names.join(', '));
+
+    // 逐字段取值（只显示读得到且不太长的）
+    log('--- 逐字段取值 ---');
+    var shown = 0;
+    for (var i = 0; i < names.length && shown < 25; i++) {
+        var fn = names[i];
+        var v = getField(el, fn);
+        if (v === null) continue;
+        shown++;
+
+        var vt = typeNameOf(v);
+        var vs = '';
+        if (typeof v === 'string') vs = ' = "' + v.slice(0, 70) + '"';
+        else if (typeof v === 'number' || typeof v === 'boolean') vs = ' = ' + v;
+        else vs = '  →' + vt;
+
+        log('  ' + fn + ' [' + vt + ']' + vs);
+    }
+    if (shown === 0) log('  （所有字段都读不到值）');
+
+    // 尝试拿 KtvMusic
+    log('--- 尝试定位 KtvMusic ---');
+    var cands = ['LIZ', 'a', 'music', 'musicInfo', 'ktvMusic'];
+    var music = null, by = '';
+    for (var j = 0; j < cands.length; j++) {
+        var cv = getField(el, cands[j]);
+        if (cv === null) continue;
+        var ct = typeNameOf(cv);
+        log('  试 ' + cands[j] + ' → ' + ct);
+        if (!music && String(ct).indexOf('KtvMusic') >= 0) {
+            music = cv; by = cands[j];
+        }
+    }
+
+    if (!music) {
+        // 兜底：遍历字段找类名含 KtvMusic 的
+        for (var k = 0; k < names.length; k++) {
+            var vv = getField(el, names[k]);
+            if (vv === null) continue;
+            if (String(typeNameOf(vv)).indexOf('KtvMusic') >= 0) {
+                music = vv; by = names[k];
+                log('  ★ 兜底命中字段: ' + names[k]);
+                break;
+            }
+        }
+    }
+
+    if (music) {
+        log('★ KtvMusic 来自字段: ' + by);
+        probeMusic(music);
+    } else {
+        logw('✗ 未找到 KtvMusic');
+    }
+}
+
+/** 探测 KtvMusic 内部（歌名 / 音频 / id） */
+function probeMusic(music) {
+    log('--- KtvMusic 内部 ---');
+    log('  类型: ' + typeNameOf(music));
+
+    try { log('  getTitle() = ' + music.getTitle()); } catch (e) { log('  getTitle 不可用'); }
+    try { log('  XC() id = ' + music.XC()); } catch (e) { log('  XC 不可用'); }
+
+    // 伴奏
+    try {
+        var ai = music.TC();
+        log('  TC() = ' + (ai ? typeNameOf(ai) : 'null'));
+        if (ai) {
+            try { log('    MC() url  = ' + String(ai.MC()).slice(0, 150)); } catch (e) { log('    MC 不可用'); }
+            try { log('    KC() hash = ' + ai.KC()); } catch (e) { log('    KC 不可用'); }
+        }
+    } catch (e) { log('  TC() 不可用'); }
+
+    // 全轨
+    try {
+        var af = music.WC();
+        log('  WC() = ' + (af ? typeNameOf(af) : 'null'));
+        if (af) {
+            try { log('    MC() url  = ' + String(af.MC()).slice(0, 150)); } catch (e) {}
+        }
+    } catch (e) { log('  WC() 不可用'); }
+
+    // 从 toString 里捞 URL
+    try {
+        var txt = strOf(music, 3000);
+        var u = firstUrl(txt);
+        if (u) log('  ★ toString 中发现 URL: ' + u.slice(0, 150));
+    } catch (e) {}
+}
+
+/** probe 模式入口：诊断一次列表 */
+var probeDone = false;
+function probeOnce(list) {
+    if (probeDone) return;
+    probeDone = true;
+
+    log('');
+    log('######## PROBE 开始 ########');
+    log('参数类型: ' + typeNameOf(list));
+
+    var n = listLen(list);
+    log('列表长度: ' + n);
+
+    if (!list || n === 0) {
+        logw('列表为空，等待下次触发');
+        probeDone = false;      // 允许下次再试
+        return;
+    }
+
+    // 第一个元素详细探测
+    probeElement(listGet(list, 0), '第 0 个元素');
+
+    // 其余元素只打简要类型，确认是否同构
+    log('');
+    log('--- 其余元素类型速览 ---');
+    var max = Math.min(n, 5);
+    for (var i = 1; i < max; i++) {
+        log('  [' + i + '] ' + typeNameOf(listGet(list, i)));
+    }
+    if (n > max) log('  ... 共 ' + n + ' 个');
+
+    // 用现有 collect() 跑一遍，看能成功几个
+    log('');
+    log('--- 用现有 collect() 试解析 ---');
+    var ok = 0, hasUrl = 0;
+    for (var j = 0; j < n; j++) {
+        var info = collect(listGet(list, j));
+        if (info) {
+            ok++;
+            if (info.url) hasUrl++;
+        }
+    }
+    log('  collect 成功 ' + ok + '/' + n + '，其中有 URL ' + hasUrl + ' 首');
+    if (ok === 0) {
+        logw('  collect 全军覆没 → 看上面的「真实类型」和「字段名」');
+    }
+
+    log('######## PROBE 结束 ########');
+    log('');
 }
 
 /* ================= 取音频信息 ================= */
@@ -815,9 +1020,23 @@ try {
 
 // ① 数据入口：拿全量列表 + 记住 RecyclerView
 try {
-    Hook.method(PLAYLIST, 'LIZJ', ['java.util.List'], function (ctx) {
+    var lizjHook = Hook.method(PLAYLIST, 'LIZJ', ['java.util.List'], function (ctx) {
         try {
-            collectAll(ctx.args[0]);
+            var list = ctx.args[0];
+
+            // ── probe 模式：只诊断结构，拿到一次就解除 Hook ──
+            if (CFG.mode === 'probe') {
+                try {
+                    probeOnce(list);
+                } finally {
+                    try { lizjHook.off(); } catch (e) {}
+                    logi('probe 完成，已解除 LIZJ Hook（改回 prod 需重启应用）');
+                }
+                return;
+            }
+
+            // ── prod 模式：正常业务 ──
+            collectAll(list);
             var rv = null;
             try { rv = ctx.this.getSelectedListRv(); } catch (e) {}
             if (rv) {
@@ -828,7 +1047,7 @@ try {
         } catch (e) { loge('LIZJ: ' + e); }
     }, 'after');
     hooked++;
-    logi('Hook OK: PlayListContainerView.LIZJ');
+    logi('Hook OK: PlayListContainerView.LIZJ  [mode=' + CFG.mode + ']');
 } catch (e) {
     loge('Hook LIZJ 失败: ' + e);
 }
