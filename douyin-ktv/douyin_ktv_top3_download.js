@@ -73,6 +73,7 @@ var needRefresh = false;        // 待刷新列表按钮
 var needSwitchTab = false;      // 待切到「已点」页签
 var probeDone = false;
 var lastList = null;      // 最近一次的 List<MusicPanel>，供手动诊断
+var _bindProbed = false;  // onBindViewHolder 参数是否已探测过
 
 /* ================= 基础工具 ================= */
 
@@ -561,6 +562,70 @@ function jsFindUrl(o, depth) {
     return '';
 }
 
+/**
+ * ★ 从 QuickHook 精简代理的 `s` 字段解析。
+ *
+ * QuickHook 把 Java 对象转成了 {@, h, c, s} 四个字段：
+ *   s = "MusicPanel(id = 7508739404626921507 , title = 天若有情（Cover A-Lin）)"
+ *
+ * 这是 KtvMusic.toString() 的文本，含 id 和 title。
+ * 虽然拿不到 URL，但足以定位是哪首歌。
+ */
+function parseProxyText(proxy) {
+    var s = '';
+    try { s = String(proxy.s || ''); } catch (e) {}
+    if (!s) return null;
+
+    // 提取所有 "key = value" 对
+    var out = {};
+    var re = /(\w+)\s*=\s*([^,)]+?)(?:\s*,\s*(?=\w+\s*=)|\s*\)\s*$)/g;
+    var m;
+    while ((m = re.exec(s)) !== null) {
+        out[m[1]] = String(m[2]).trim();
+    }
+
+    if (!out.id && !out.title) return null;
+
+    return out;
+}
+
+/**
+ * 处理 {@,h,c,s} 形式的代理对象。
+ * 返回 {title, musicId, raw} 或 null。
+ */
+function parseProxy(panel) {
+    // 确认是精简代理
+    var hasAt = false, hasH = false, hasC = false, hasS = false;
+    try {
+        hasAt = (panel['@'] !== undefined);
+        hasH = (panel.h !== undefined);
+        hasC = (panel.c !== undefined);
+        hasS = (panel.s !== undefined);
+    } catch (e) { return null; }
+
+    if (!hasS) return null;
+
+    var cls = '';
+    try { cls = String(panel.c || ''); } catch (e) {}
+
+    // 只处理跟歌曲相关的类
+    if (cls && cls.indexOf('MusicPanel') < 0 &&
+        cls.indexOf('KtvMusic') < 0 &&
+        cls.indexOf('Song') < 0) {
+        return null;
+    }
+
+    var txt = parseProxyText(panel);
+    if (!txt) return null;
+
+    return {
+        title: txt.title || '',
+        musicId: txt.id || '',
+        className: cls,
+        raw: String(panel.s || '')
+    };
+}
+
 /** JS 对象路径解析 */
 function parseFromJSObject(panel) {
     var found = findMusicInJS(panel);
@@ -603,7 +668,24 @@ function parseFromJSObject(panel) {
 function parsePanel(panel, idx) {
     if (!panel) return null;
 
-    // ── ① 纯 JS 对象路径（QuickHook 实际给的就是这个） ──
+    // ── ⓪ QuickHook 精简代理 {@,h,c,s} —— 从 s 文本解析 ──
+    var px = parseProxy(panel);
+    if (px) {
+        return {
+            key: keyOf(px.title, ''),
+            title: px.title || ('#' + (px.musicId || idx)),
+            artist: '',
+            musicId: px.musicId,
+            url: '',                       // 代理里没有 URL
+            track: '',
+            hash: '',
+            ext: CFG.defaultExt,
+            viaField: 'proxy:s',
+            proxyRaw: px.raw
+        };
+    }
+
+    // ── ① 纯 JS 对象路径 ──
     if (isPlainObject(panel)) {
         var r = parseFromJSObject(panel);
         if (r) return r;
@@ -783,6 +865,58 @@ function probeOnce(list) {
                 log('    反射字段数: ' + (fs ? fs.length : 0));
             }
         } catch (e) { log('    反射失败: ' + e); }
+    }
+
+    // ⑨.5 尝试还原 Java 句柄
+    //    QuickHook 给的是 {@, h, c, s} 精简代理：
+    //      @ = "@o" 标记，h = 句柄id，c = 类名，s = toString
+    //    试 Java.ref() 能否还原成可操作句柄。
+    log('');
+    log('════ 句柄还原尝试 ════');
+    var h = undefined, c = '';
+    try { h = first.h; } catch (e) {}
+    try { c = String(first.c || ''); } catch (e) {}
+    log('  代理信息: h=' + h + '  c=' + c);
+
+    var refd = null;
+    // 方式1：Java.ref(整个代理对象)
+    try {
+        if (typeof Java.ref === 'function') {
+            refd = Java.ref(first);
+            log('  Java.ref(first) → ' + describe(refd));
+            if (refd) {
+                log('    $get 类型: ' + typeof refd.$get);
+                log('    $type: ' + (refd.$type || '(无)'));
+                try { log('    $str: ' + String(refd.$str()).slice(0, 200)); } catch (e) { log('    $str 不可用'); }
+            }
+        } else {
+            log('  Java.ref 不存在');
+        }
+    } catch (e) { log('  Java.ref(first) 失败: ' + e); }
+
+    // 方式2：Java.ref(h) 传句柄 id
+    try {
+        if (typeof Java.ref === 'function' && h !== undefined) {
+            var r2 = Java.ref(h);
+            log('  Java.ref(h=' + h + ') → ' + describe(r2));
+        }
+    } catch (e) { log('  Java.ref(h) 失败: ' + e); }
+
+    // 方式3：按类名 Java.use 后尝试强转
+    try {
+        if (h !== undefined && c) {
+            var C = Java.use(c);
+            log('  Java.use("' + c + '") → 成功, $methods=' + (C.$methods ? C.$methods().length : '?'));
+        }
+    } catch (e) { log('  Java.use(c) 失败: ' + e); }
+
+    // 方式4：如果还原成功，试着拿字段
+    if (refd) {
+        try {
+            var flds = refd.$fields ? refd.$fields() : null;
+            log('  还原后 $fields: ' + (flds ? flds.length + ' 个' : '不可用'));
+            if (flds) for (var fi = 0; fi < Math.min(flds.length, 10); fi++) log('    ' + flds[fi]);
+        } catch (e) { log('  还原后 $fields 失败: ' + e); }
     }
 
     // ⑩ 尝试解析
@@ -1446,6 +1580,89 @@ try {
     hooked++;
     logi('Hook OK: Fragment.onResume（zeq 兜底）');
 } catch (e) { logw('Hook Fragment.onResume 跳过'); }
+
+// ⑤.5 onBindViewHolder —— 这里能拿到原始 Java 参数
+//
+// LIZJ 拿到的 List 元素被 QuickHook 降级成了 {@,h,c,s} 代理，
+// 没有字段和方法。但 onBindViewHolder 的 ctx.args[1] 是方法入参，
+// 有可能是完整句柄。这是拿 URL 的关键突破口。
+try {
+    Hook.method('X.0FZs', 'onBindViewHolder',
+        ['androidx.recyclerview.widget.RecyclerView$ViewHolder', 'java.lang.Object'],
+        function (ctx) {
+            try {
+                var item = ctx.args[1];
+                if (!item) return;
+
+                // 只在第一次详细探测
+                if (!_bindProbed) {
+                    _bindProbed = true;
+                    log('');
+                    log('════ onBindViewHolder 参数探测 ════');
+                    log('  item typeof: ' + (typeof item));
+                    log('  item 描述: ' + describe(item));
+
+                    var ks = null;
+                    try { ks = Object.keys(item); } catch (e) {}
+                    log('  Object.keys: [' + (ks || []).join(', ') + ']');
+
+                    // 是否有 Java 句柄 API
+                    var apis = ['$get', '$fields', '$type', '$str', 'getClass', '$handle', '$is'];
+                    for (var i = 0; i < apis.length; i++) {
+                        var t = '?';
+                        try { t = typeof item[apis[i]]; } catch (e) { t = 'err'; }
+                        log('    ' + apis[i] + ' : ' + t);
+                    }
+
+                    // 尝试拿 LIZ（KtvMusic）
+                    var music = null;
+                    try { music = item.LIZ; } catch (e) {}
+                    if (music === undefined) { try { music = item.$get('LIZ'); } catch (e) {} }
+                    log('  item.LIZ → ' + describe(music));
+
+                    if (music) {
+                        log('  --- KtvMusic 探测 ---');
+                        log('    $get: ' + typeof music.$get);
+                        log('    $type: ' + (music.$type || '(无)'));
+
+                        // 试 TC / WC
+                        var tcs = ['TC', 'WC', 'getTitle', 'XC'];
+                        for (var j = 0; j < tcs.length; j++) {
+                            var fn = null;
+                            try { fn = music[tcs[j]]; } catch (e) {}
+                            if (typeof fn === 'function') {
+                                try {
+                                    var rv = fn.call(music);
+                                    log('    ' + tcs[j] + '() = ' + describe(rv));
+                                    if (rv && typeof rv === 'object') {
+                                        try { log('        MC() = ' + rv.MC()); } catch (e) {}
+                                        try { log('        KC() = ' + rv.KC()); } catch (e) {}
+                                    }
+                                } catch (e) { log('    ' + tcs[j] + '() 调用失败: ' + e); }
+                            } else {
+                                log('    ' + tcs[j] + ' 不是函数');
+                            }
+                        }
+
+                        // $str 里找 URL
+                        try {
+                            var st = music.$str ? String(music.$str()) : '';
+                            log('    $str 长度: ' + st.length);
+                            var u = firstUrl(st);
+                            if (u) log('    ★ $str 里发现 URL: ' + u.slice(0, 120));
+                            else log('    $str 前 200 字: ' + st.slice(0, 200));
+                        } catch (e) {}
+                    }
+                    log('════ 探测结束 ════');
+                    log('');
+                }
+            } catch (e) {
+                loge('onBindViewHolder 探测异常: ' + e);
+            }
+        }, 'after');
+    hooked++;
+    logi('Hook OK: X.0FZs.onBindViewHolder（探测参数）');
+} catch (e) { logw('Hook onBindViewHolder 跳过: ' + e); }
 
 // ⑥ 记录 BaseFirstLevelTabManager 实例（页签切换的执行者）
 //    hook LIZ 的 before，任何调用都会带上 this
