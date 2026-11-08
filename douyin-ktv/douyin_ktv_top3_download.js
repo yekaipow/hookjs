@@ -18,7 +18,7 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v8-json';
+var BUILD = 'v9-handle';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
@@ -665,12 +665,265 @@ function parseFromJSObject(panel) {
     };
 }
 
+/* ================= ★ 句柄还原（v9 新 API） ================= */
+/**
+ * QuickHook 把 Java 对象降级成 {@, h, c, s} 代理：
+ *   @  引用标记 "@o"
+ *   h  句柄 id（真对象还在内存里）
+ *   c  类名
+ *   s  toString 文本
+ *
+ * 用新加的 API 还原成可操作句柄：
+ *   Java.fromHandle(h, className)
+ *   Java.ref(h) / Java.ref(proxy)
+ *   proxy.$get / $call / $keys
+ */
+
+var _resolveStat = { fromHandle: 0, refH: 0, refObj: 0, proxyGet: 0, none: 0 };
+
+function resolveHandle(proxy) {
+    if (!proxy) return null;
+
+    var h, cls = '';
+    try { h = proxy.h; } catch (e) {}
+    try { cls = String(proxy.c || ''); } catch (e) {}
+
+    // ① Java.fromHandle(h, className)
+    if (typeof Java.fromHandle === 'function' && h !== undefined) {
+        try {
+            var r1 = Java.fromHandle(h, cls);
+            if (r1) { _resolveStat.fromHandle++; return r1; }
+        } catch (e) { d('fromHandle 失败: ' + e); }
+    }
+
+    // ② Java.ref(h)
+    if (typeof Java.ref === 'function' && h !== undefined) {
+        try {
+            var r2 = Java.ref(h);
+            if (r2 && r2 !== h) { _resolveStat.refH++; return r2; }
+        } catch (e) { d('Java.ref(h) 失败: ' + e); }
+    }
+
+    // ③ Java.ref(proxy)
+    if (typeof Java.ref === 'function') {
+        try {
+            var r3 = Java.ref(proxy);
+            if (r3 && r3 !== proxy) { _resolveStat.refObj++; return r3; }
+        } catch (e) { d('Java.ref(proxy) 失败: ' + e); }
+    }
+
+    // ④ 代理自带 $get
+    if (typeof proxy.$get === 'function') {
+        _resolveStat.proxyGet++;
+        return proxy;
+    }
+
+    _resolveStat.none++;
+    return null;
+}
+
+/** 句柄读字段：$get 优先，其次 $keys 找，最后属性 */
+function hGet(obj, name) {
+    if (!obj) return null;
+    try {
+        if (typeof obj.$get === 'function') {
+            var v = obj.$get(name);
+            if (v !== undefined && v !== null) return v;
+        }
+    } catch (e) {}
+    try {
+        if (typeof obj.$keys === 'function') {
+            var ks = obj.$keys();
+            var arr = (typeof ks === 'string') ? ks.split(',') : ks;
+            for (var i = 0; i < arr.length; i++) {
+                if (String(arr[i]).trim() === name) {
+                    var v2 = obj.$get(name);
+                    if (v2 !== undefined && v2 !== null) return v2;
+                }
+            }
+        }
+    } catch (e) {}
+    try {
+        var v3 = obj[name];
+        if (v3 !== undefined && v3 !== null) return v3;
+    } catch (e) {}
+    return null;
+}
+
+/** 句柄调方法：$call 优先，其次直接调用 */
+function hCall(obj, method, args) {
+    if (!obj) return null;
+    try {
+        if (typeof obj.$call === 'function') {
+            return obj.$call(method, args || []);
+        }
+    } catch (e) { d('$call(' + method + ') 失败: ' + e); }
+    try {
+        var fn = obj[method];
+        if (typeof fn === 'function') return fn.apply(obj, args || []);
+    } catch (e) {}
+    return null;
+}
+
+/** 句柄的字段名列表 */
+function hKeys(obj) {
+    if (!obj) return [];
+    try {
+        if (typeof obj.$keys === 'function') {
+            var ks = obj.$keys();
+            if (typeof ks === 'string') return ks.split(',');
+            if (ks && ks.length !== undefined) {
+                var out = [];
+                for (var i = 0; i < ks.length; i++) out.push(String(ks[i]));
+                return out;
+            }
+        }
+    } catch (e) {}
+    try {
+        if (typeof obj.$fields === 'function') {
+            var fs = obj.$fields() || [];
+            var o2 = [];
+            for (var j = 0; j < fs.length; j++) {
+                var parts = String(fs[j]).split(/\s+/);
+                o2.push(parts[parts.length - 1]);
+            }
+            return o2;
+        }
+    } catch (e) {}
+    return [];
+}
+
+/** 从 KtvMusic 句柄取音频 URL */
+function hPickAudio(music) {
+    if (!music) return null;
+
+    var tracks = [
+        { m: 'TC', t: 'accompaniment' },
+        { m: 'WC', t: 'fullTrack' }
+    ];
+
+    for (var i = 0; i < tracks.length; i++) {
+        var ai = hCall(music, tracks[i].m);
+        if (!ai) continue;
+
+        var u = hCall(ai, 'MC');
+        var hh = hCall(ai, 'KC');
+        var us = u === null || u === undefined ? '' : String(u);
+        if (us.length > 10 && /^https?:/i.test(us)) {
+            return { url: us, hash: hh ? String(hh) : '', track: tracks[i].t };
+        }
+    }
+
+    // 直给 String 的方法
+    var dirs = [['sD', 'extra_s'], ['iD', 'extra_i']];
+    for (var j = 0; j < dirs.length; j++) {
+        var sv = hCall(music, dirs[j][0]);
+        if (sv && /^https?:/i.test(String(sv))) {
+            return { url: String(sv), hash: '', track: dirs[j][1] };
+        }
+    }
+
+    // 遍历字段找 http
+    var ks = hKeys(music);
+    for (var k = 0; k < ks.length; k++) {
+        var fv = hGet(music, ks[k]);
+        if (typeof fv === 'string') {
+            var fu = firstUrl(fv);
+            if (fu) return { url: fu, hash: '', track: 'field:' + ks[k] };
+        }
+    }
+
+    // $str 兜底
+    try {
+        var st = '';
+        if (typeof music.$str === 'function') st = String(music.$str());
+        var su = firstUrl(st);
+        if (su) return { url: su, hash: '', track: 'toString' };
+    } catch (e) {}
+
+    return null;
+}
+
+/** 从 panel 句柄解析出完整信息 */
+function parseFromHandle(panelHandle, idx) {
+    // 取 KtvMusic
+    var music = hGet(panelHandle, 'LIZ');
+    if (!music) {
+        var ks = hKeys(panelHandle);
+        for (var i = 0; i < ks.length; i++) {
+            if (ks[i] === 'LIZ' || ks[i].indexOf('LIZ') === 0) {
+                music = hGet(panelHandle, ks[i]);
+                if (music) break;
+            }
+        }
+    }
+    if (!music) return null;
+
+    // 歌名
+    var title = '';
+    try {
+        var t = hCall(music, 'getTitle');
+        if (t) title = String(t);
+    } catch (e) {}
+    if (!title) {
+        try { var t2 = hCall(music, 'fD'); if (t2) title = String(t2); } catch (e) {}
+    }
+    if (!title) {
+        var td = hGet(music, 'd');
+        if (typeof td === 'string') title = td;
+    }
+
+    // 歌手
+    var artist = '';
+    try { var a = hCall(music, 'YC'); if (a && String(a).length < 50) artist = String(a); } catch (e) {}
+    if (!artist) {
+        var ab = hGet(music, 'b');
+        if (typeof ab === 'string' && ab.length < 50) artist = ab;
+    }
+
+    // id
+    var musicId = '';
+    try { var mid = hCall(music, 'XC'); if (mid) musicId = String(mid); } catch (e) {}
+    if (!musicId) {
+        try { var mid2 = hCall(music, 'getId'); if (mid2) musicId = String(mid2); } catch (e) {}
+    }
+
+    var audio = hPickAudio(music);
+
+    return {
+        key: keyOf(title, artist),
+        title: title || ('#' + (musicId || idx)),
+        artist: artist,
+        musicId: musicId,
+        url: audio ? audio.url : '',
+        track: audio ? audio.track : CFG.defaultTrack,
+        hash: audio ? audio.hash : '',
+        ext: audio ? extFromUrl(audio.url) : CFG.defaultExt,
+        viaField: 'handle'
+    };
+}
+
 function parsePanel(panel, idx) {
     if (!panel) return null;
 
-    // ── ⓪ QuickHook 精简代理 {@,h,c,s} —— 从 s 文本解析 ──
+    var fallback = null;   // 句柄路径拿到但无 URL 时的备选
+
+    // ── ★ ⓪ 最高优先：还原句柄，拿完整数据（含 URL） ──
+    var hd = resolveHandle(panel);
+    if (hd) {
+        var r = parseFromHandle(hd, idx);
+        if (r && r.url) return r;                 // 完整成功
+        if (r) {
+            d('句柄路径拿到数据但无 URL: ' + r.title);
+            fallback = r;
+        }
+    }
+
+    // ── ① QuickHook 精简代理 {@,h,c,s} —— 从 s 文本兜底 ──
     var px = parseProxy(panel);
     if (px) {
+        // 如果句柄路径拿到了歌名（只是没 URL），优先用句柄的
+        if (fallback) return fallback;
         return {
             key: keyOf(px.title, ''),
             title: px.title || ('#' + (px.musicId || idx)),
@@ -917,6 +1170,39 @@ function probeOnce(list) {
             log('  还原后 $fields: ' + (flds ? flds.length + ' 个' : '不可用'));
             if (flds) for (var fi = 0; fi < Math.min(flds.length, 10); fi++) log('    ' + flds[fi]);
         } catch (e) { log('  还原后 $fields 失败: ' + e); }
+    }
+
+    // ⑨.6 句柄还原测试（新 API）
+    log('');
+    log('════ 句柄还原（v9 新 API） ════');
+    log('  Java.fromHandle: ' + typeof Java.fromHandle);
+    log('  Java.ref       : ' + typeof Java.ref);
+    log('  proxy.$get     : ' + typeof first.$get);
+    log('  proxy.$call    : ' + typeof first.$call);
+    log('  proxy.$keys    : ' + typeof first.$keys);
+
+    var rh = resolveHandle(first);
+    if (rh) {
+        log('  ✓ 还原成功');
+        log('    $type: ' + (function(){try{return rh.$type||'?';}catch(e){return '?';}})());
+        try { log('    $keys: [' + hKeys(rh).join(',') + ']'); } catch (e) {}
+    } else {
+        log('  ✗ 还原失败（四条路径都不可用）');
+    }
+
+    if (rh) {
+        var pa = parseFromHandle(rh, 0);
+        if (pa) {
+            log('  --- parseFromHandle 结果 ---');
+            log('    标题: ' + pa.title);
+            log('    歌手: ' + pa.artist);
+            log('    id  : ' + pa.musicId);
+            log('    URL : ' + (pa.url || '(无)'));
+            log('    音轨: ' + pa.track);
+            log('    hash: ' + (pa.hash || '(无)'));
+        } else {
+            log('  parseFromHandle 返回 null');
+        }
     }
 
     // ⑩ 尝试解析
