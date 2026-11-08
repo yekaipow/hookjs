@@ -18,7 +18,7 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v9.1-prod';
+var BUILD = 'v9.3-handler';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
@@ -1564,7 +1564,7 @@ function flushPending() {
     needRefresh = false;
     needSwitchTab = false;
 
-    Ui.post(function () {
+    postToMain(function () {
         try {
             if (doSwitch && pendingSwitch && !switchedThisOpen) {
                 tryAutoSwitch();
@@ -1581,7 +1581,7 @@ function flushPending() {
         // 执行期间可能又置了新标志，再消费一轮（限次，防死循环）
         if ((needMountTrigger || needRefresh || needSwitchTab) && _flushRetry < 5) {
             _flushRetry++;
-            Ui.post(function () { flushPending(); });
+            postToMain(function () { flushPending(); });
         } else {
             _flushRetry = 0;
         }
@@ -1594,19 +1594,71 @@ function flushPending() {
  * 被 Hook 占用而同步执行，因此在 Hook 回调里调用是安全的。
  * 回调触发时主线程已空闲，可以放心操作 Ui。
  */
-function postToMain(fn) {
+/**
+ * ★ 把任务真正「排队」到主线程消息队列。
+ *
+ * 为什么需要这个：
+ *   Hook 回调运行在主线程，且此时主线程被 Hook 占用。
+ *   Ui.post 在这种上下文里会「同步执行」，导致 Ui.create 抛
+ *     IllegalStateException: 主线程正被 Hook 回调占用
+ *
+ *   Handler.post 则是把 Runnable 塞进 MessageQueue，等当前
+ *   消息（即 Hook 所在的调用栈）处理完后才执行。这才是安全的。
+ *
+ * QuickHook 支持用 JS 对象实现 Java 接口：
+ *   Java.use('java.lang.Runnable').$new({ run: function(){...} })
+ * 不同版本写法可能不同，这里依次尝试几种。
+ */
+var _mainHandler = null;
+
+function getMainHandler() {
+    if (_mainHandler) return _mainHandler;
     try {
         var Looper = Java.use('android.os.Looper');
         var Handler = Java.use('android.os.Handler');
-        var h = Handler.$new(Looper.getMainLooper());
-        var Runnable = Java.use('java.lang.Runnable');
-        // QuickHook 支持用 JS 函数实现 Java 接口的情况有限，
-        // 这里退化到 Ui.post（在非 Hook 上下文时它是安全的）
-        Ui.post(fn);
-        return true;
+        _mainHandler = Handler.$new(Looper.getMainLooper());
+        logi('主线程 Handler 已创建');
     } catch (e) {
-        d('postToMain 失败，退化 Ui.post: ' + e);
-        try { Ui.post(fn); return true; } catch (e2) { return false; }
+        loge('创建 Handler 失败: ' + e);
+    }
+    return _mainHandler;
+}
+
+function postToMain(fn) {
+    var h = getMainHandler();
+    if (!h) {
+        // 实在没有 Handler，退回 Ui.post
+        try { Ui.post(fn); return true; } catch (e) { return false; }
+    }
+
+    // 方式1：用 Java 接口代理实现 Runnable
+    try {
+        var Runnable = Java.use('java.lang.Runnable');
+        var r = Runnable.$new({ run: fn });
+        h.post(r);
+        return true;
+    } catch (e1) {
+        d('Runnable.$new(JSObj) 失败: ' + e1);
+    }
+
+    // 方式2：Java.registerClass
+    try {
+        var Runnable2 = Java.use('java.lang.Runnable');
+        var Cls = Java.registerClass({
+            name: 'com.qh.MainRunner' + (new Date().getTime()),
+            implements: [Runnable2],
+            methods: { run: fn }
+        });
+        h.post(Cls.$new());
+        return true;
+    } catch (e2) {
+        d('registerClass 失败: ' + e2);
+    }
+
+    // 方式3：退到 Ui.post
+    try { Ui.post(fn); return true; } catch (e3) {
+        loge('postToMain 全部失败: ' + e3);
+        return false;
     }
 }
 
@@ -1847,9 +1899,11 @@ try {
             try { rv = ctx.this.getSelectedListRv(); } catch (e) {}
             if (rv) { listRv = rv; targetRv = rv; }
 
-            // 只置标志，不调 Ui（LIZJ 在主线程且被 Hook 占用）
+            // 置标志，然后立刻交给 Handler 排队消费
+            // （flushPending 内部用 postToMain，不会同步执行 Ui）
             if (triggerHost && !triggerMounted) needMountTrigger = true;
             if (armed) needRefresh = true;
+            flushPending();
         } catch (e) { loge('LIZJ: ' + e); }
     }, 'after');
     hooked++;
@@ -1880,9 +1934,10 @@ try {
                 if (!listRv) listRv = v;
                 targetRv = v;
 
-                // 只置标志，不调 Ui
+                // 置标志，交给 Handler 排队消费
                 if (triggerHost && !triggerMounted) needMountTrigger = true;
                 if (armed) needRefresh = true;
+                if (needMountTrigger || needRefresh) flushPending();
             } catch (e) {}
         }, 'after');
     hooked++;
@@ -1901,8 +1956,9 @@ try {
                 if (!ok) return;
                 if (ctx.args[0] === 0) {
                     lastSig = '';
-                    // 只置标志
+                    // 置标志 + 排队消费
                     if (armed) needRefresh = true;
+                    if (needRefresh) flushPending();
                 }
             } catch (e) {}
         }, 'after');
@@ -2103,7 +2159,7 @@ try {
 logi('=== 加载完成：' + hooked + ' 个 Hook ===');
 
 // 启动自驱动：加载时先排一次，之后由各 Hook 置标志 + flushPending 自续
-Ui.post(function () {
+postToMain(function () {
     try { flushPending(); } catch (e) { loge('初始 flush 失败: ' + e); }
 });
 
@@ -2193,3 +2249,11 @@ function dumpTabs() {
 }
 
 log('提示: show() / dumpFirst() / forceProbe() / testSwitchOrdered() / dumpTabs()');
+
+// 提前创建主线程 Handler，确认可用性
+try {
+    var _h = getMainHandler();
+    logi('Handler 就绪: ' + (_h ? '可用' : '不可用（将退化 Ui.post）'));
+} catch (e) {
+    loge('Handler 初始化失败: ' + e);
+}
