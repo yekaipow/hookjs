@@ -18,7 +18,7 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v9.4-active';
+var BUILD = 'v10-test-btn';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
@@ -71,6 +71,7 @@ var dirty = false, flushing = false;
 var needMountTrigger = false;   // 待挂载 zeq 触发按钮
 var needRefresh = false;        // 待刷新列表按钮
 var needSwitchTab = false;      // 待切到「已点」页签
+var needMountTest = false;      // 待挂测试按钮
 var probeDone = false;
 var lastList = null;      // 最近一次的 List<MusicPanel>，供手动诊断
 var _bindProbed = false;  // onBindViewHolder 参数是否已探测过
@@ -1555,14 +1556,16 @@ function refresh() {
 var _flushRetry = 0;
 
 function flushPending() {
-    if (!needMountTrigger && !needRefresh && !needSwitchTab) return;
+    if (!needMountTrigger && !needRefresh && !needSwitchTab && !needMountTest) return;
 
     var doMount = needMountTrigger;
     var doRefresh = needRefresh;
     var doSwitch = needSwitchTab;
+    var doTest = needMountTest;
     needMountTrigger = false;
     needRefresh = false;
     needSwitchTab = false;
+    needMountTest = false;
 
     postToMain(function () {
         try {
@@ -1575,11 +1578,14 @@ function flushPending() {
             if (doRefresh && armed) {
                 refresh();
             }
+            if (doTest && testHost && !testMounted) {
+                ensureTestButton();
+            }
         } catch (e) {
             loge('flushPending: ' + e);
         }
         // 执行期间可能又置了新标志，再消费一轮（限次，防死循环）
-        if ((needMountTrigger || needRefresh || needSwitchTab) && _flushRetry < 5) {
+        if ((needMountTrigger || needRefresh || needSwitchTab || needMountTest) && _flushRetry < 5) {
             _flushRetry++;
             postToMain(function () { flushPending(); });
         } else {
@@ -1740,6 +1746,220 @@ function ensureTrigger() {
                  ' triggerHost=' + (triggerHost ? '有' : '无'));
         }
     }
+}
+
+/* ================= ★ 测试按钮：eas 父节点 ================= */
+/**
+ * eas (0x7f0a20ce) 是 RealTimeChorusOperateView 里的「点歌」TextView。
+ * 它的父节点是 0x7f0a20d0，对应 RealTimeChorusOperateView 的字段 g
+ * （ConstraintLayout，反编译确认）。
+ *
+ * 在这个父节点里加一个测试按钮：
+ *   点击 → 尝试获取点播列表 → 弹窗显示结果
+ *
+ * ★ 为什么点击是最佳时机
+ *   点击回调运行在主线程但【不在 Hook 上下文中】，
+ *   Ui.create / Ui.post / Ui.alert 全都能安全使用，
+ *   不会出现「主线程正被 Hook 回调占用」。
+ */
+
+var HOST_ID_EAS_PARENT = 2131370192;   // 0x7f0a20d0
+var TAG_TEST = 'qh_test_btn';
+var testHost = null;
+var testMounted = false;
+
+/** 在 eas 的父容器里挂测试按钮 */
+function ensureTestButton() {
+    if (!testHost || testMounted) return false;
+
+    try {
+        var hostUi = null;
+        try { hostUi = Ui.root(testHost); } catch (e) {}
+        if (!hostUi) { d('testHost→Ui 失败'); return false; }
+
+        // 已存在
+        var exist = findBtn(hostUi, TAG_TEST);
+        if (exist) { testMounted = true; return false; }
+
+        var btn = makeBtn('测列表', TAG_TEST);
+        try { Ui.insert(hostUi, btn, 'child'); } catch (e) {
+            loge('插入测试按钮失败: ' + e);
+            return false;
+        }
+
+        Ui.onClick(btn, function () {
+            log('');
+            log('════════ 测试按钮点击 ════════');
+            try {
+                var r = tryGetSongList();
+                if (r.ok) {
+                    Ui.alert('获取成功',
+                        '来源：' + r.via +
+                        '\n长度：' + r.count +
+                        '\n\n' + (r.preview || ''));
+                } else {
+                    Ui.alert('获取失败',
+                        '尝试了 ' + r.tried + ' 条路径\n\n' + (r.detail || ''));
+                }
+            } catch (e) {
+                loge('测试按钮异常: ' + e);
+                Ui.alert('异常', String(e));
+            }
+        });
+
+        testMounted = true;
+        logi('★ 测试按钮已挂到 eas 父节点');
+        return true;
+    } catch (e) {
+        loge('ensureTestButton: ' + e);
+        return false;
+    }
+}
+
+/**
+ * 尝试获取点播列表，返回 {ok, via, count, preview, tried, detail}
+ * 全部在「非 Hook 上下文」执行，可以随便用 Java / Ui。
+ */
+function tryGetSongList() {
+    var tried = [], detail = [];
+
+    // ── 路径0：已采集的 songs 池（最可靠，LIZJ/LIZLLL 已经填充过） ──
+    tried.push('songs池');
+    var keys = Object.keys(songs);
+    if (keys.length) {
+        logi('路径0 成功: songs 池 ' + keys.length + ' 首');
+        var lines = [];
+        for (var i = 0; i < keys.length && i < 10; i++) {
+            var s0 = songs[keys[i]];
+            lines.push((i + 1) + '. ' + s0.title
+                + (s0.artist ? ' - ' + s0.artist : '')
+                + '  id=' + (s0.musicId || '?')
+                + '  ' + (s0.url ? '✔URL' : '✘'));
+        }
+        if (keys.length > 10) lines.push('... 共 ' + keys.length + ' 首');
+        return {
+            ok: true, via: 'songs池（已采集）', count: keys.length,
+            preview: lines.join('\n'), tried: tried
+        };
+    }
+    detail.push('路径0: songs 池为空（还没采集过）');
+
+    // ── 路径1：从已缓存的 listRv 拿 adapter ──
+    var rv = listRv || targetRv;
+    if (rv) {
+        tried.push('listRv.adapter');
+        try {
+            var ad = rv.getAdapter();
+            if (ad) {
+                var items = null;
+                try { items = ad.getItems(); } catch (e) {}
+                if (!items) { try { items = ad.$get('items'); } catch (e) {} }
+                if (items) {
+                    var n = listLen(items);
+                    logi('路径1 成功: adapter.getItems() 长度 ' + n);
+                    return {
+                        ok: true, via: 'adapter.getItems()', count: n,
+                        preview: previewList(items), tried: tried
+                    };
+                }
+                detail.push('路径1: adapter 有但 items 读不到');
+            } else {
+                detail.push('路径1: rv.getAdapter() 返回 null');
+            }
+        } catch (e) { detail.push('路径1 异常: ' + e); }
+    } else {
+        detail.push('路径1: listRv 为空');
+    }
+
+    // ── 路径2：遍历 UI 树找 PlayListContainerView ──
+    tried.push('UI树遍历');
+    try {
+        var root = Ui.root();
+        if (root) {
+            var rvs = asArray(Ui.find(root, { cls: 'androidx.recyclerview.widget.RecyclerView' }));
+            log('路径2: 找到 ' + rvs.length + ' 个 RecyclerView');
+            for (var i = 0; i < rvs.length; i++) {
+                try {
+                    var h = rvs[i].$handle;
+                    if (!h) continue;
+                    // 通过句柄拿 Java 对象
+                    var javaRv = null;
+                    try { javaRv = Java.fromHandle(h, 'androidx.recyclerview.widget.RecyclerView'); } catch (e) {}
+                    if (!javaRv) { try { javaRv = Java.ref(h); } catch (e) {} }
+                    if (!javaRv) continue;
+
+                    var ad2 = javaRv.getAdapter();
+                    if (!ad2) continue;
+                    var it2 = null;
+                    try { it2 = ad2.getItems(); } catch (e) {}
+                    if (!it2) { try { it2 = ad2.$get('items'); } catch (e) {} }
+                    if (it2 && listLen(it2) > 0) {
+                        var n2 = listLen(it2);
+                        logi('路径2 成功: 第 ' + i + ' 个 RV 长度 ' + n2);
+                        listRv = javaRv;   // 顺手记住
+                        return {
+                            ok: true, via: 'UI树第' + i + '个RV', count: n2,
+                            preview: previewList(it2), tried: tried
+                        };
+                    }
+                } catch (e) { detail.push('路径2 [' + i + '] 异常: ' + e); }
+            }
+        } else {
+            detail.push('路径2: Ui.root() 为空');
+        }
+    } catch (e) { detail.push('路径2 异常: ' + e); }
+
+    // ── 路径3：直接用 UI 文本推断（兜底） ──
+    tried.push('UI文本');
+    try {
+        var root2 = Ui.root();
+        var items = Ui.find(root2, { cls: 'TextView' });
+        var arr = asArray(items);
+        var names = [];
+        for (var j = 0; j < arr.length && names.length < 10; j++) {
+            var t = Ui.text(arr[j]);
+            if (!t) continue;
+            t = String(t).trim();
+            if (t.length < 1 || t.length > 30) continue;
+            if (/^\d+$/.test(t)) continue;
+            if (/^\d{1,2}:\d{2}$/.test(t)) continue;
+            names.push(t);
+        }
+        if (names.length) {
+            detail.push('路径3: 从界面读到 ' + names.length + ' 个文本');
+            return {
+                ok: true, via: 'UI文本（无数据模型）', count: names.length,
+                preview: names.join('\n'), tried: tried
+            };
+        }
+        detail.push('路径3: 界面上没读到候选文本');
+    } catch (e) { detail.push('路径3 异常: ' + e); }
+
+    return { ok: false, tried: tried.join(' / '), detail: detail.join('\n') };
+}
+
+/** 列表预览文本 */
+function previewList(list) {
+    var n = listLen(list);
+    var out = [];
+    for (var i = 0; i < n && i < 8; i++) {
+        var el = listGet(list, i);
+        if (!el) { out.push((i + 1) + '. (null)'); continue; }
+
+        // 尝试解析出歌名
+        var info = null;
+        try { info = parsePanel(el, i); } catch (e) {}
+        if (info && info.title) {
+            out.push((i + 1) + '. ' + info.title
+                + (info.artist ? ' - ' + info.artist : '')
+                + '  id=' + (info.musicId || '?')
+                + '  ' + (info.url ? '✔URL' : '✘'));
+        } else {
+            out.push((i + 1) + '. ' + describe(el));
+        }
+    }
+    if (n > 8) out.push('... 共 ' + n + ' 首');
+    return out.join('\n');
 }
 
 /* ================= 自动切到「已点」 ================= */
@@ -2130,6 +2350,39 @@ try {
     hooked++;
     logi('Hook OK: X.0FZs.onBindViewHolder（探测参数）');
 } catch (e) { logw('Hook onBindViewHolder 跳过: ' + e); }
+
+// ⑤.8 捕获 eas 父容器，挂测试按钮
+//
+// eas = 0x7f0a20ce（「点歌」TextView），父节点 0x7f0a20d0
+// 在 RealTimeChorusOperateView 的构造函数里 iput 到字段 g。
+// Hook 构造函数 after，直接从实例读 g。
+try {
+    // 构造函数有 2 个重载，用 Hook.all 覆盖
+    Hook.all('com.bytedance.android.livesdk.ktvimpl.realtimechorus.RealTimeChorusOperateView',
+        '<init>', function (ctx) {
+            try {
+                var self = ctx.this;
+                if (!self) return;
+
+                // 字段 g 就是 0x7f0a20d0 这个 ConstraintLayout
+                var g = null;
+                try { g = self.$get ? self.$get('g') : null; } catch (e) {}
+                if (!g) { try { g = self.g; } catch (e) {} }
+
+                if (g) {
+                    testHost = g;
+                    testMounted = false;
+                    needMountTest = true;
+                    logi('已捕获 eas 父容器，准备挂测试按钮');
+                    flushPending();
+                } else {
+                    d('RealTimeChorusOperateView.g 读不到');
+                }
+            } catch (e) { d('RCOV init: ' + e); }
+        }, 'after');
+    hooked++;
+    logi('Hook OK: RealTimeChorusOperateView.<init>（捕获 eas 父容器）');
+} catch (e) { logw('Hook RCOV.<init> 跳过: ' + e); }
 
 // ⑥ 记录 BaseFirstLevelTabManager 实例（页签切换的执行者）
 //    hook LIZ 的 before，任何调用都会带上 this
