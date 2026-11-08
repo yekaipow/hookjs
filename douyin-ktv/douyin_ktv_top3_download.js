@@ -18,7 +18,7 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v7-rewrite';
+var BUILD = 'v8-json';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
@@ -72,6 +72,7 @@ var needMountTrigger = false;   // 待挂载 zeq 触发按钮
 var needRefresh = false;        // 待刷新列表按钮
 var needSwitchTab = false;      // 待切到「已点」页签
 var probeDone = false;
+var lastList = null;      // 最近一次的 List<MusicPanel>，供手动诊断
 
 /* ================= 基础工具 ================= */
 
@@ -410,19 +411,35 @@ var _injectErrShown = false;
 /** 判断是不是纯 JS 对象（不是 Java 句柄） */
 function isPlainObject(v) {
     if (!v || typeof v !== 'object') return false;
-    // Java 句柄会有 $get / $type 之类
+
+    // ① Java 句柄的判据：有 $get / $type / getClass 这类
     try {
         if (typeof v.$get === 'function') return false;
+        if (typeof v.$fields === 'function') return false;
         if (typeof v.$type === 'string') return false;
-        if (v.$type !== undefined && v.$type !== null) return false;
+        if (typeof v.getClass === 'function') return false;
     } catch (e) {}
-    // 纯 JS 对象一定支持 Object.keys
+
+    // ② 真 JS 数组 → 算普通对象
+    if (Object.prototype.toString.call(v) === '[object Array]') return true;
+
+    // ③ 有 enumerable keys → 普通对象
     try {
         var ks = Object.keys(v);
-        return ks !== null && typeof ks.length === 'number';
-    } catch (e) {
-        return false;
+        if (ks && ks.length > 0) return true;
+    } catch (e) {}
+
+    // ④ 关键：Proxy 式对象 keys 为空，但属性可直接访问。
+    //    试探几个常见字段名，能读到值就认为是普通 JS 对象。
+    var probeNames = ['LIZ', 'lIZ', 'music', 'musicInfo', 'title', 'id', 'a', 'b', 'd'];
+    for (var i = 0; i < probeNames.length; i++) {
+        try {
+            var val = v[probeNames[i]];
+            if (val !== undefined) return true;
+        } catch (e) {}
     }
+
+    return false;
 }
 
 /** 在 JS 对象里按名字找字段（大小写不敏感） */
@@ -448,32 +465,35 @@ function jsGet(v, name) {
  * 判据：有 title / artist / url 之类常见键，或键数量 > 5。
  */
 function findMusicInJS(panel) {
-    var ks = [];
-    try { ks = Object.keys(panel) || []; } catch (e) { return null; }
-
-    // ① 优先常见字段名
+    // ① 优先常见字段名（不依赖 Object.keys）
     var prefer = ['LIZ', 'lIZ', 'music', 'musicInfo', 'ktvMusic', 'a'];
     for (var i = 0; i < prefer.length; i++) {
-        var v = jsGet(panel, prefer[i]);
-        if (v && typeof v === 'object' && !Array.isArray(v)) return { obj: v, name: prefer[i] };
+        var v;
+        try { v = panel[prefer[i]]; } catch (e) { continue; }
+        if (v && typeof v === 'object') {
+            if (Object.prototype.toString.call(v) !== '[object Array]') {
+                return { obj: v, name: prefer[i] };
+            }
+        }
     }
 
-    // ② 遍历：挑键最多的那个对象（KtvMusic 字段很多）
+    // ② 若 keys 可用，挑键最多的子对象（KtvMusic 字段很多）
+    var ks = [];
+    try { ks = Object.keys(panel) || []; } catch (e) {}
     var best = null, bestN = 0;
     for (var j = 0; j < ks.length; j++) {
-        var k = ks[j];
         var val;
-        try { val = panel[k]; } catch (e) { continue; }
+        try { val = panel[ks[j]]; } catch (e) { continue; }
         if (!val || typeof val !== 'object') continue;
         if (Object.prototype.toString.call(val) === '[object Array]') continue;
         var sub = [];
         try { sub = Object.keys(val); } catch (e) { continue; }
         if (sub.length > bestN) {
             bestN = sub.length;
-            best = { obj: val, name: k };
+            best = { obj: val, name: ks[j] };
         }
     }
-    if (best && bestN >= 3) return best;
+    if (best && bestN >= 2) return best;
 
     return null;
 }
@@ -490,12 +510,22 @@ function jsStr(music, names) {
 /** 从 JS 对象里递归找 URL */
 function jsFindUrl(o, depth) {
     depth = depth || 0;
-    if (depth > 3 || !o || typeof o !== 'object') return '';
+    if (depth > 4 || !o || typeof o !== 'object') return '';
 
+    // 收集候选键：Object.keys + 常见字段名
     var ks = [];
-    try { ks = Object.keys(o) || []; } catch (e) { return ''; }
+    try { ks = Object.keys(o) || []; } catch (e) {}
+    // Proxy 式对象 keys 可能为空，补一批常见名
+    var extra = ['url', 'uri', 'playUrl', 'songUrl', 'meta_url', 'MC',
+                 'p', 'o', 'audio', 'audioInfo', 'track', 'meta_song_url',
+                 'meta_full_track', 'meta_vocal_url', 'a', 'b', 'c', 'd', 'e'];
+    for (var x = 0; x < extra.length; x++) {
+        var found = false;
+        for (var y = 0; y < ks.length; y++) { if (ks[y] === extra[x]) { found = true; break; } }
+        if (!found) ks.push(extra[x]);
+    }
 
-    // 先扫本层字符串
+    // ① 本层字符串
     for (var i = 0; i < ks.length; i++) {
         var v;
         try { v = o[ks[i]]; } catch (e) { continue; }
@@ -504,13 +534,15 @@ function jsFindUrl(o, depth) {
             if (u) return u;
         }
     }
-    // 再递归子对象/数组
+
+    // ② 递归子对象 / 数组
     for (var j = 0; j < ks.length; j++) {
         var c;
         try { c = o[ks[j]]; } catch (e) { continue; }
         if (!c || typeof c !== 'object') continue;
+
         if (Object.prototype.toString.call(c) === '[object Array]') {
-            for (var k = 0; k < c.length && k < 5; k++) {
+            for (var k = 0; k < c.length && k < 8; k++) {
                 var el = c[k];
                 if (typeof el === 'string') {
                     var uu = firstUrl(el);
@@ -525,6 +557,7 @@ function jsFindUrl(o, depth) {
             if (u2) return u2;
         }
     }
+
     return '';
 }
 
@@ -654,79 +687,117 @@ function probeOnce(list) {
     if (probeDone) return false;
 
     log('');
-    log('╔══════════ PROBE v8 ══════════╗');
+    log('╔══════════ PROBE v8.1 穷举探针 ══════════╗');
 
     var n = listLen(list);
     log('列表长度: ' + n);
-    log('List 本体: ' + describe(list));
+    log('list 的 typeof: ' + (typeof list));
+    log('list instanceof Array: ' + (list instanceof Array));
 
-    if (!n) {
-        log('列表为空，等下次');
-        return false;
-    }
-
+    if (!n) { log('列表为空'); return false; }
     probeDone = true;
 
     var first = listGet(list, 0);
     log('');
-    log('--- 第 0 个元素 ---');
-    log('  描述: ' + describe(first));
-    log('  typeof: ' + (typeof first));
-    log('  是数组: ' + (Object.prototype.toString.call(first) === '[object Array]'));
+    log('════ 元素访问方式逐一测试 ════');
 
-    // ★ 关键：QuickHook 可能已把 Java 对象转成纯 JS 对象
-    var keys = [];
-    try { keys = Object.keys(first) || []; } catch (e) {}
-    log('  Object.keys 数量: ' + keys.length);
+    // ① typeof / 构造
+    log('[1] typeof = ' + (typeof first));
+    try { log('    constructor = ' + (first && first.constructor ? first.constructor.name : '?')); } catch (e) { log('    constructor 读取失败'); }
 
-    if (keys.length) {
-        log('  --- 逐字段 ---');
-        for (var i = 0; i < keys.length && i < 40; i++) {
-            var k = keys[i];
-            var v;
-            try { v = first[k]; } catch (e) { log('    ' + k + ' = <读取失败>'); continue; }
-            var desc = '';
-            if (v === null) desc = 'null';
-            else if (v === undefined) desc = 'undefined';
-            else if (typeof v === 'string') desc = '"' + (v.length > 70 ? v.slice(0, 70) + '...' : v) + '"';
-            else if (typeof v === 'number' || typeof v === 'boolean') desc = String(v);
-            else if (Object.prototype.toString.call(v) === '[object Array]') desc = 'Array(' + v.length + ')';
-            else {
-                var ks = [];
-                try { ks = Object.keys(v); } catch (e) {}
-                desc = 'Object{' + ks.slice(0, 6).join(',') + (ks.length > 6 ? ',...' : '') + '}';
-            }
-            log('    ' + k + ' : ' + desc);
-        }
-    } else {
-        // 没有 keys：可能是真 Java 对象，走反射
-        log('  → 无 JS 字段，尝试 Java 反射');
-        try { reflectDump(first, '[0]', { depth: 1 }); } catch (e) { loge('  反射失败: ' + e); }
+    // ② Object.keys
+    var keys = null;
+    try {
+        keys = Object.keys(first);
+        log('[2] Object.keys = [' + (keys || []).join(', ') + ']  共 ' + (keys ? keys.length : 0));
+    } catch (e) { log('[2] Object.keys 抛异常: ' + e); }
+
+    // ③ getOwnPropertyNames
+    try {
+        var pn = Object.getOwnPropertyNames(first);
+        log('[3] getOwnPropertyNames = [' + pn.join(', ') + ']  共 ' + pn.length);
+    } catch (e) { log('[3] getOwnPropertyNames 抛异常: ' + e); }
+
+    // ④ for...in
+    try {
+        var fi = [];
+        for (var kk in first) { fi.push(kk); if (fi.length > 40) break; }
+        log('[4] for...in = [' + fi.join(', ') + ']  共 ' + fi.length);
+    } catch (e) { log('[4] for...in 抛异常: ' + e); }
+
+    // ⑤ JSON.stringify
+    try {
+        var js = JSON.stringify(first);
+        log('[5] JSON.stringify 长度 = ' + (js ? js.length : 0));
+        if (js) log('    前 400 字: ' + js.slice(0, 400));
+    } catch (e) { log('[5] JSON.stringify 抛异常: ' + e); }
+
+    // ⑥ toString
+    try {
+        log('[6] String() = ' + String(first).slice(0, 200));
+    } catch (e) { log('[6] String() 抛异常'); }
+
+    // ⑦ 常见 Java 句柄 API
+    log('[7] Java 句柄 API 检测:');
+    var apis = ['$get', '$fields', '$type', '$str', '$is', '$new', 'getClass', '$handle'];
+    for (var a = 0; a < apis.length; a++) {
+        var t = '?';
+        try { t = typeof first[apis[a]]; } catch (e) { t = '抛异常'; }
+        log('    ' + apis[a] + ' : ' + t);
     }
 
-    // 尝试各种解析路径
+    // ⑧ 直接按名字试探（Proxy 可能只支持属性访问）
+    log('[8] 直接属性访问测试:');
+    var names = ['LIZ', 'lIZ', 'music', 'musicInfo', 'ktvMusic', 'a', 'title', 'id', 'b', 'd'];
+    for (var b = 0; b < names.length; b++) {
+        var nm = names[b];
+        var got;
+        var err = null;
+        try { got = first[nm]; } catch (e) { err = e; }
+        if (err) { log('    ' + nm + ' → 抛异常: ' + err); continue; }
+        if (got === undefined) { log('    ' + nm + ' → undefined'); continue; }
+        log('    ' + nm + ' → ' + describe(got));
+        // 如果是对象，再挖一层
+        if (got && typeof got === 'object') {
+            var subKeys = null;
+            try { subKeys = Object.keys(got); } catch (e) {}
+            log('        └ keys = [' + (subKeys || []).join(', ') + ']');
+            // 继续试 title/id/url
+            var subs = ['title', 'artist', 'id', 'd', 'b', 'a', 'url', 'meta_song_url', 'p', 'o'];
+            for (var c = 0; c < subs.length; c++) {
+                var sv;
+                try { sv = got[subs[c]]; } catch (e) { continue; }
+                if (sv !== undefined) log('        .' + subs[c] + ' = ' + describe(sv));
+            }
+        }
+    }
+
+    // ⑨ 用反射兜底（若 keys 为空但真的是 Java 对象）
+    if (!keys || !keys.length) {
+        log('[9] keys 为空，尝试 Java 反射');
+        try {
+            var cls = null;
+            try { cls = first.getClass(); } catch (e) { log('    getClass 不可用'); }
+            if (cls) {
+                var fs = cls.getDeclaredFields();
+                log('    反射字段数: ' + (fs ? fs.length : 0));
+            }
+        } catch (e) { log('    反射失败: ' + e); }
+    }
+
+    // ⑩ 尝试解析
     log('');
-    log('--- 解析尝试 ---');
+    log('════ 解析尝试 ════');
     var info = parsePanel(first, 0);
     if (info) {
-        log('✓ 成功');
-        log('  歌名: ' + info.title);
-        log('  歌手: ' + info.artist);
-        log('  id  : ' + info.musicId);
-        log('  来源: ' + info.viaField);
-        log('  URL : ' + (info.url ? info.url.slice(0, 150) : '(无)'));
-        log('  音轨: ' + info.track);
+        log('✓ 成功! 歌名=' + info.title + ' 歌手=' + info.artist
+            + ' id=' + info.musicId + ' via=' + info.viaField);
+        log('  URL=' + (info.url || '(无)'));
     } else {
-        loge('✗ 失败');
-        // 深挖：把一个元素的 toString 或 JSON 打出来
-        try {
-            var txt = '';
-            try { txt = JSON.stringify(first); } catch (e) { txt = '<无法 JSON 化>'; }
-            log('  JSON: ' + String(txt).slice(0, 600));
-        } catch (e) {}
+        loge('✗ 失败 —— 请把上面 [1]~[10] 全部贴给我');
     }
 
-    log('╚══════════ PROBE v8 ══════════╝');
+    log('╚══════════ PROBE v8.1 ══════════╝');
     log('');
     return true;
 }
@@ -1270,6 +1341,7 @@ try {
     var lizjHook = Hook.method(PLAYLIST_CLS, 'LIZJ', ['java.util.List'], function (ctx) {
         try {
             var list = ctx.args[0];
+            lastList = list;   // 留一份给手动诊断用
 
             // probe 模式
             if (CFG.mode === 'probe') {
@@ -1486,6 +1558,19 @@ function dumpFirst() {
             });
         } catch (e) { loge('dumpFirst: ' + e); }
     });
+}
+
+/**
+ * 手动穷举探针：用最近一次 LIZJ 拿到的 list 重跑诊断。
+ * 不需要重启，改完脚本直接在日志页调用即可。
+ */
+function probeLast() {
+    if (!lastList) {
+        logw('还没有捕获到列表，请先打开一次点歌面板');
+        return;
+    }
+    probeDone = false;
+    probeOnce(lastList);
 }
 
 function forceProbe() {
