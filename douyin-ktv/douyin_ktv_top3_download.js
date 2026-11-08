@@ -18,13 +18,13 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v9-handle';
+var BUILD = 'v9.1-prod';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
      * 'prod'  = 正常功能：注入按钮 + 下载
      */
-    mode: 'probe',
+    mode: 'prod',
 
     maxRows: 3,          // 只处理前 3 行
     threads: 6,          // 下载并发（API 上限 8）
@@ -844,6 +844,25 @@ function hPickAudio(music) {
     return null;
 }
 
+/**
+ * ★ 精确取 long 型 id。
+ * JS number 只有 53 位精度，抖音的 musicId 是 19 位（long），
+ * 直接 String(musicId) 会变成 6.85e18 这种科学计数法。
+ *
+ * 解决：优先从 $str() 文本里正则提取，那里的数字是原始字符串。
+ *   例如 "MusicPanel(id = 6857477704963328001 , title = 起风了)"
+ */
+function exactIdFromText(text) {
+    if (!text || typeof text !== 'string') return '';
+    // 匹配 id = 数字 （可能带空格）
+    var m = text.match(/id\s*=\s*(\d{6,})/i);
+    if (m) return m[1];
+    // 兜底：匹配任意 15 位以上连续数字（排除科学计数法）
+    var m2 = text.match(/\b(\d{15,})\b/);
+    if (m2) return m2[1];
+    return '';
+}
+
 /** 从 panel 句柄解析出完整信息 */
 function parseFromHandle(panelHandle, idx) {
     // 取 KtvMusic
@@ -874,16 +893,67 @@ function parseFromHandle(panelHandle, idx) {
     }
 
     // 歌手
+    // 歌手：必须是「像人名的字符串」，排除纯数字（那是 id）
     var artist = '';
-    try { var a = hCall(music, 'YC'); if (a && String(a).length < 50) artist = String(a); } catch (e) {}
+    function looksLikeArtist(v) {
+        if (typeof v !== 'string') return false;
+        var t = v.trim();
+        if (!t || t.length > 40) return false;
+        if (/^\\d+$/.test(t)) return false;        // 纯数字 → 是 id，不是歌手
+        if (/^\\d+\\.?\\d*[eE]\\+?\\d+$/.test(t)) return false;
+        return true;
+    }
+    // ① 字段 b（反编译确认的歌手字段）
+    var ab = hGet(music, 'b');
+    if (looksLikeArtist(ab)) artist = ab.trim();
+    // ② 方法 YC
     if (!artist) {
-        var ab = hGet(music, 'b');
-        if (typeof ab === 'string' && ab.length < 50) artist = ab;
+        try {
+            var a = hCall(music, 'YC');
+            if (looksLikeArtist(a)) artist = String(a).trim();
+        } catch (e) {}
+    }
+    // ③ 遍历字段找
+    if (!artist) {
+        var mk = hKeys(music);
+        for (var ai = 0; ai < mk.length; ai++) {
+            var an = mk[ai];
+            if (an === 'b' || an === 'artist' || an === 'singer') {
+                var av = hGet(music, an);
+                if (looksLikeArtist(av)) { artist = String(av).trim(); break; }
+            }
+        }
     }
 
     // id
+    // ★ id 必须精确：优先从文本提取，避免 long → number 精度丢失
     var musicId = '';
-    try { var mid = hCall(music, 'XC'); if (mid) musicId = String(mid); } catch (e) {}
+    // ① 从 music 的 $str 取
+    try {
+        var mstr = '';
+        if (typeof music.$str === 'function') mstr = String(music.$str());
+        musicId = exactIdFromText(mstr);
+    } catch (e) {}
+    // ② 从 panel 的 $str 取（MusicPanel 的 toString 里也有 id）
+    if (!musicId) {
+        try {
+            var pstr = '';
+            if (typeof panelHandle.$str === 'function') pstr = String(panelHandle.$str());
+            musicId = exactIdFromText(pstr);
+        } catch (e) {}
+    }
+    // ③ 兜底：方法调用（可能是 number，精度可能丢失，记 warning）
+    if (!musicId) {
+        try {
+            var mid = hCall(music, 'XC');
+            if (mid !== null && mid !== undefined) {
+                musicId = String(mid);
+                if (musicId.indexOf('e+') >= 0 || musicId.indexOf('E') >= 0) {
+                    logw('id 精度可能丢失: ' + musicId + '（文本里没找到原始值）');
+                }
+            }
+        } catch (e) {}
+    }
     if (!musicId) {
         try { var mid2 = hCall(music, 'getId'); if (mid2) musicId = String(mid2); } catch (e) {}
     }
