@@ -124,6 +124,20 @@ function extFromUrl(u) {
 
 /* ================= 类型 / 字符串 ================= */
 
+/** 一句话描述任意值，用于诊断 */
+function describe(v) {
+    if (v === null) return 'null';
+    if (v === undefined) return 'undefined';
+    var t = typeof v;
+    if (t === 'string') return 'string(' + v.length + ')';
+    if (t === 'number' || t === 'boolean') return t + ':' + v;
+    if (t === 'function') return 'function';
+    if (Object.prototype.toString.call(v) === '[object Array]') return 'Array(' + v.length + ')';
+    var ks = [];
+    try { ks = Object.keys(v); } catch (e) {}
+    return 'Object{' + ks.length + ' keys}';
+}
+
 function typeNameOf(o) {
     if (o === null) return 'null';
     if (o === undefined) return 'undefined';
@@ -380,24 +394,196 @@ function pickMusicId(music) {
 }
 
 /* ================= 解析一个 MusicPanel ================= */
+/**
+ * ★ 重大发现（v8）
+ *   QuickHook 在把 Java List 传给 JS 时，会把元素【转成纯 JS 对象】：
+ *     · element.getClass 不是函数（TypeError: not a function）
+ *     · element 上没有任何 $get / $fields / $type
+ *     · 但它有普通的 JS 属性（Object.keys 能拿到）
+ *
+ *   所以解析必须走 JS 对象路径：直接读属性名，不能用反射。
+ *   同时保留 Java 反射分支，以防某些场景下拿到的是真句柄。
+ */
 var failShown = false;
 var _injectErrShown = false;
+
+/** 判断是不是纯 JS 对象（不是 Java 句柄） */
+function isPlainObject(v) {
+    if (!v || typeof v !== 'object') return false;
+    // Java 句柄会有 $get / $type 之类
+    try {
+        if (typeof v.$get === 'function') return false;
+        if (typeof v.$type === 'string') return false;
+        if (v.$type !== undefined && v.$type !== null) return false;
+    } catch (e) {}
+    // 纯 JS 对象一定支持 Object.keys
+    try {
+        var ks = Object.keys(v);
+        return ks !== null && typeof ks.length === 'number';
+    } catch (e) {
+        return false;
+    }
+}
+
+/** 在 JS 对象里按名字找字段（大小写不敏感） */
+function jsGet(v, name) {
+    if (!v || typeof v !== 'object') return undefined;
+    try {
+        if (name in v) return v[name];
+    } catch (e) {}
+    // 大小写变体
+    var lower = String(name).toLowerCase();
+    var ks = [];
+    try { ks = Object.keys(v); } catch (e) { return undefined; }
+    for (var i = 0; i < ks.length; i++) {
+        if (String(ks[i]).toLowerCase() === lower) {
+            try { return v[ks[i]]; } catch (e) {}
+        }
+    }
+    return undefined;
+}
+
+/**
+ * 在 JS 对象里找一个「看起来像 KtvMusic」的子对象。
+ * 判据：有 title / artist / url 之类常见键，或键数量 > 5。
+ */
+function findMusicInJS(panel) {
+    var ks = [];
+    try { ks = Object.keys(panel) || []; } catch (e) { return null; }
+
+    // ① 优先常见字段名
+    var prefer = ['LIZ', 'lIZ', 'music', 'musicInfo', 'ktvMusic', 'a'];
+    for (var i = 0; i < prefer.length; i++) {
+        var v = jsGet(panel, prefer[i]);
+        if (v && typeof v === 'object' && !Array.isArray(v)) return { obj: v, name: prefer[i] };
+    }
+
+    // ② 遍历：挑键最多的那个对象（KtvMusic 字段很多）
+    var best = null, bestN = 0;
+    for (var j = 0; j < ks.length; j++) {
+        var k = ks[j];
+        var val;
+        try { val = panel[k]; } catch (e) { continue; }
+        if (!val || typeof val !== 'object') continue;
+        if (Object.prototype.toString.call(val) === '[object Array]') continue;
+        var sub = [];
+        try { sub = Object.keys(val); } catch (e) { continue; }
+        if (sub.length > bestN) {
+            bestN = sub.length;
+            best = { obj: val, name: k };
+        }
+    }
+    if (best && bestN >= 3) return best;
+
+    return null;
+}
+
+/** 从 JS 对象形态的 KtvMusic 里取字符串 */
+function jsStr(music, names) {
+    for (var i = 0; i < names.length; i++) {
+        var v = jsGet(music, names[i]);
+        if (typeof v === 'string' && v) return v;
+    }
+    return '';
+}
+
+/** 从 JS 对象里递归找 URL */
+function jsFindUrl(o, depth) {
+    depth = depth || 0;
+    if (depth > 3 || !o || typeof o !== 'object') return '';
+
+    var ks = [];
+    try { ks = Object.keys(o) || []; } catch (e) { return ''; }
+
+    // 先扫本层字符串
+    for (var i = 0; i < ks.length; i++) {
+        var v;
+        try { v = o[ks[i]]; } catch (e) { continue; }
+        if (typeof v === 'string') {
+            var u = firstUrl(v);
+            if (u) return u;
+        }
+    }
+    // 再递归子对象/数组
+    for (var j = 0; j < ks.length; j++) {
+        var c;
+        try { c = o[ks[j]]; } catch (e) { continue; }
+        if (!c || typeof c !== 'object') continue;
+        if (Object.prototype.toString.call(c) === '[object Array]') {
+            for (var k = 0; k < c.length && k < 5; k++) {
+                var el = c[k];
+                if (typeof el === 'string') {
+                    var uu = firstUrl(el);
+                    if (uu) return uu;
+                } else if (el && typeof el === 'object') {
+                    var u3 = jsFindUrl(el, depth + 1);
+                    if (u3) return u3;
+                }
+            }
+        } else {
+            var u2 = jsFindUrl(c, depth + 1);
+            if (u2) return u2;
+        }
+    }
+    return '';
+}
+
+/** JS 对象路径解析 */
+function parseFromJSObject(panel) {
+    var found = findMusicInJS(panel);
+    if (!found) {
+        if (!failShown) {
+            failShown = true;
+            loge('【JS 解析】panel 里找不到像 KtvMusic 的对象');
+            var ks = [];
+            try { ks = Object.keys(panel) || []; } catch (e) {}
+            log('  panel 键(' + ks.length + '): ' + ks.join(', '));
+        }
+        return null;
+    }
+
+    var music = found.obj;
+
+    var title = jsStr(music, ['title', 'd', 'songName', 'musicName', 'name']);
+    var artist = jsStr(music, ['artist', 'b', 'singer', 'artistName', 'author']);
+    var musicId = '';
+    var idv = jsGet(music, 'id');
+    if (idv === undefined) idv = jsGet(music, 'a');
+    if (idv === undefined) idv = jsGet(music, 'musicId');
+    if (idv !== undefined && idv !== null) musicId = String(idv);
+
+    var url = jsFindUrl(music);
+
+    return {
+        key: keyOf(title, artist),
+        title: title || ('#' + (musicId || '?')),
+        artist: artist,
+        musicId: musicId,
+        url: url,
+        track: url ? CFG.defaultTrack : '',
+        hash: '',
+        ext: url ? extFromUrl(url) : CFG.defaultExt,
+        viaField: 'JS:' + found.name
+    };
+}
 
 function parsePanel(panel, idx) {
     if (!panel) return null;
 
-    // 定位 KtvMusic：反射按类型找，不用猜字段名
+    // ── ① 纯 JS 对象路径（QuickHook 实际给的就是这个） ──
+    if (isPlainObject(panel)) {
+        var r = parseFromJSObject(panel);
+        if (r) return r;
+        return null;
+    }
+
+    // ── ② Java 句柄路径（兜底，保留旧逻辑） ──
     var pfields = reflectFieldsOnly(panel);
     var music = null, byField = '';
 
-    // ① 按类型名含 KtvMusic
     var mf = findFieldByType(pfields, 'KtvMusic');
-    if (mf && mf.value) {
-        music = mf.value;
-        byField = mf.name;
-    }
+    if (mf && mf.value) { music = mf.value; byField = mf.name; }
 
-    // ② 兜底：试常见字段名
     if (!music) {
         var cands = ['LIZ', 'a', 'music', 'musicInfo'];
         for (var i = 0; i < cands.length; i++) {
@@ -409,38 +595,28 @@ function parsePanel(panel, idx) {
     if (!music) {
         if (!failShown) {
             failShown = true;
-            loge('【解析失败】panel 里找不到 KtvMusic 类型字段');
-            log('  panel 字段共 ' + pfields.length + ' 个:');
-            for (var k = 0; k < pfields.length && k < 25; k++) {
-                var f = pfields[k];
-                var vs = '';
-                if (typeof f.value === 'string') vs = ' = "' + f.value.slice(0, 50) + '"';
-                else if (typeof f.value === 'number' || typeof f.value === 'boolean') vs = ' = ' + f.value;
-                else vs = '  →' + shortType(typeNameOf(f.value));
-                log('    ' + f.name + ' [' + f.type + ']' + vs);
-            }
+            loge('【反射解析】panel 里找不到 KtvMusic 类型字段');
+            log('  panel 字段共 ' + pfields.length + ' 个');
         }
         return null;
     }
 
-    var title = pickTitle(music);
-    var artist = pickArtist(music);
-    var musicId = pickMusicId(music);
+    var title2 = pickTitle(music);
+    var artist2 = pickArtist(music);
+    var musicId2 = pickMusicId(music);
     var audio = pickUrlFromMusic(music);
 
-    var info = {
-        key: keyOf(title, artist),
-        title: title || ('#' + (musicId || idx)),
-        artist: artist,
-        musicId: musicId,
+    return {
+        key: keyOf(title2, artist2),
+        title: title2 || ('#' + (musicId2 || idx)),
+        artist: artist2,
+        musicId: musicId2,
         url: audio ? audio.url : '',
         track: audio ? audio.track : CFG.defaultTrack,
         hash: audio ? audio.hash : '',
         ext: audio ? extFromUrl(audio.url) : CFG.defaultExt,
         viaField: byField
     };
-
-    return info;
 }
 
 /** 批量采集 */
@@ -449,10 +625,10 @@ function collectAll(list) {
     var n = listLen(list);
     if (!n) return 0;
 
-    var ok = 0, hasUrl = 0;
+    var ok = 0, hasUrl = 0, failed = 0;
     for (var i = 0; i < n; i++) {
         var info = parsePanel(listGet(list, i), i);
-        if (!info) continue;
+        if (!info) { failed++; continue; }
         ok++;
         if (info.url) hasUrl++;
 
@@ -460,7 +636,8 @@ function collectAll(list) {
         songs[info.key] = info;
     }
 
-    logi('采集 ' + ok + '/' + n + ' 首，有 URL ' + hasUrl + ' 首');
+    logi('采集 ' + ok + '/' + n + ' 首，有 URL ' + hasUrl + ' 首'
+         + (failed ? '，失败 ' + failed : ''));
     if (ok > 0 && _lastCount < 0) {
         _lastCount = ok;
         // 第一次成功时，打一首样例
@@ -477,11 +654,11 @@ function probeOnce(list) {
     if (probeDone) return false;
 
     log('');
-    log('╔══════════ PROBE ══════════╗');
+    log('╔══════════ PROBE v8 ══════════╗');
 
     var n = listLen(list);
     log('列表长度: ' + n);
-    log('List 类型: ' + shortType(typeNameOf(list)));
+    log('List 本体: ' + describe(list));
 
     if (!n) {
         log('列表为空，等下次');
@@ -492,14 +669,47 @@ function probeOnce(list) {
 
     var first = listGet(list, 0);
     log('');
-    log('--- 第 0 个元素 完整结构 ---');
-    reflectDump(first, '[0]', { depth: 1 });
+    log('--- 第 0 个元素 ---');
+    log('  描述: ' + describe(first));
+    log('  typeof: ' + (typeof first));
+    log('  是数组: ' + (Object.prototype.toString.call(first) === '[object Array]'));
 
+    // ★ 关键：QuickHook 可能已把 Java 对象转成纯 JS 对象
+    var keys = [];
+    try { keys = Object.keys(first) || []; } catch (e) {}
+    log('  Object.keys 数量: ' + keys.length);
+
+    if (keys.length) {
+        log('  --- 逐字段 ---');
+        for (var i = 0; i < keys.length && i < 40; i++) {
+            var k = keys[i];
+            var v;
+            try { v = first[k]; } catch (e) { log('    ' + k + ' = <读取失败>'); continue; }
+            var desc = '';
+            if (v === null) desc = 'null';
+            else if (v === undefined) desc = 'undefined';
+            else if (typeof v === 'string') desc = '"' + (v.length > 70 ? v.slice(0, 70) + '...' : v) + '"';
+            else if (typeof v === 'number' || typeof v === 'boolean') desc = String(v);
+            else if (Object.prototype.toString.call(v) === '[object Array]') desc = 'Array(' + v.length + ')';
+            else {
+                var ks = [];
+                try { ks = Object.keys(v); } catch (e) {}
+                desc = 'Object{' + ks.slice(0, 6).join(',') + (ks.length > 6 ? ',...' : '') + '}';
+            }
+            log('    ' + k + ' : ' + desc);
+        }
+    } else {
+        // 没有 keys：可能是真 Java 对象，走反射
+        log('  → 无 JS 字段，尝试 Java 反射');
+        try { reflectDump(first, '[0]', { depth: 1 }); } catch (e) { loge('  反射失败: ' + e); }
+    }
+
+    // 尝试各种解析路径
     log('');
-    log('--- 用反射解析试试 ---');
+    log('--- 解析尝试 ---');
     var info = parsePanel(first, 0);
     if (info) {
-        log('✓ 解析成功');
+        log('✓ 成功');
         log('  歌名: ' + info.title);
         log('  歌手: ' + info.artist);
         log('  id  : ' + info.musicId);
@@ -507,17 +717,16 @@ function probeOnce(list) {
         log('  URL : ' + (info.url ? info.url.slice(0, 150) : '(无)'));
         log('  音轨: ' + info.track);
     } else {
-        loge('✗ 解析失败，看上面的字段列表');
+        loge('✗ 失败');
+        // 深挖：把一个元素的 toString 或 JSON 打出来
+        try {
+            var txt = '';
+            try { txt = JSON.stringify(first); } catch (e) { txt = '<无法 JSON 化>'; }
+            log('  JSON: ' + String(txt).slice(0, 600));
+        } catch (e) {}
     }
 
-    log('');
-    log('--- 其余元素类型速览 ---');
-    var max = Math.min(n, 4);
-    for (var i = 1; i < max; i++) {
-        log('  [' + i + '] ' + shortType(typeNameOf(listGet(list, i))));
-    }
-
-    log('╚══════════ PROBE ══════════╝');
+    log('╚══════════ PROBE v8 ══════════╝');
     log('');
     return true;
 }
