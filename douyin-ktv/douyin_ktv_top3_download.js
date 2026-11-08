@@ -898,9 +898,8 @@ function parseFromHandle(panelHandle, idx) {
     function looksLikeArtist(v) {
         if (typeof v !== 'string') return false;
         var t = v.trim();
-        if (!t || t.length > 40) return false;
-        if (/^\\d+$/.test(t)) return false;        // 纯数字 → 是 id，不是歌手
-        if (/^\\d+\\.?\\d*[eE]\\+?\\d+$/.test(t)) return false;
+        if (/^\d+$/.test(t)) return false;          // 纯数字 → 是 id，不是歌手
+        if (/^\d+\.?\d*[eE]\+?\d+$/.test(t)) return false;   // 科学计数法
         return true;
     }
     // ① 字段 b（反编译确认的歌手字段）
