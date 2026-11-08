@@ -641,9 +641,9 @@ function tryInstall(attempt) {
 var hooked = 0;
 var _observed = false;
 
-/* ① RCOV.<init> —— 拿实例、拿 eac */
+/* ① RCOV.<init> —— 拿实例、拿 eac（构造函数必须用 Hook.ctor，Hook.all 不认 <init>） */
 try {
-    Hook.all(RCOV, '<init>', function (ctx) {
+    Hook.ctor(RCOV, null, function (ctx) {
         try {
             var self = ctx.this;
             if (!self) return;
