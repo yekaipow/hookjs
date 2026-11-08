@@ -1,0 +1,13 @@
+# 私钥、凭据一律不入库
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.ssh/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+__pycache__/
+node_modules/
