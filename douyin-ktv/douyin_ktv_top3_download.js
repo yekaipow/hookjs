@@ -35,7 +35,15 @@ var CFG = {
 
     btnText: '下载',
     defaultTrack: 'accompaniment',
-    defaultExt: '.mp3'
+    defaultExt: '.mp3',
+
+    /**
+     * 自动切到「已点」
+     * 点击直播间的「点歌」按钮后，等面板打开，再自动切到「已点」页签。
+     * 需要 mode='prod' 才生效。
+     */
+    autoSwitchToOrdered: true,
+    autoSwitchDelayMs: 450      // 等面板展开的时间，太短会切不动
 };
 
 /* ===== 常量：反编译确认的资源 id ===== */
@@ -799,18 +807,137 @@ function ensureTrigger() {
     } catch (e) { loge('ensureTrigger: ' + e); }
 }
 
+/* ================= 自动切到「已点」 ================= */
+/**
+ * 反编译结论（抖音 41.0.0）：
+ *
+ * 页签切换入口
+ *   BaseFirstLevelTabManager.LIZ(int tabValue, String tabKey)
+ *     └─ LJI(FT3, String) 翻译 → 找 Fragment → yM(0FYq, 0Fa2) 切换
+ *
+ * 页签枚举 LX/0FT3（LIZ() 返回 value）
+ *   Unknown=0, FirstOpenTab=1, OrderedSongTab=2 ← 已点,
+ *   OrderSongTab=3 ← 点歌, MySongTab=4
+ *
+ * TabLayout 在 BaseFirstLevelTabManager 字段 l，
+ * 字段 j 是 Map<FT3, Integer>（tab 下标）
+ */
+
+var FT3_ORDERED = 2;          // OrderedSongTab.value  「已点」
+var FT3_ORDER = 3;            // OrderSongTab.value    「点歌」
+
+// 记录 manager 实例（BaseFirstLevelTabManager 的任一子类都行）
+var tabManager = null;
+// 「点歌」按钮被点过，等面板打开就切
+var pendingSwitch = false;
+// 已切过，避免重复
+var switchedThisOpen = false;
+
+/**
+ * 切换页签到指定 FT3。
+ * 优先用 manager.LIZ(value, key)，退而用 TabLayout 直接选。
+ */
+function switchTab(targetValue, targetKey) {
+    // ① 官方入口
+    if (tabManager) {
+        try {
+            tabManager.LIZ(targetValue, targetKey || '');
+            logi('切页签: 调用 LIZ(' + targetValue + ')');
+            return true;
+        } catch (e) {
+            d('LIZ 失败，试 TabLayout: ' + e);
+        }
+    }
+
+    // ② TabLayout 直接选（查字段 j 的映射）
+    try {
+        var tl = null;
+        try { tl = tabManager.l; } catch (e) {}
+        if (tl) {
+            var idx = -1;
+            try {
+                var ft3 = Java.use('X.0FT3');
+                var field = targetValue === FT3_ORDERED ? 'OrderedSongTab' : 'OrderSongTab';
+                var enumObj = ft3.$get(field);
+                var map = tabManager.j;
+                if (map && enumObj) {
+                    var iv = map.get(enumObj);
+                    if (iv) idx = iv.intValue();
+                }
+            } catch (e) { d('取 tab 下标失败: ' + e); }
+
+            if (idx < 0) {
+                // 兜底：字符串匹配 tab 文本
+                var cnt = 0;
+                try { cnt = tl.getTabCount(); } catch (e) {}
+                for (var i = 0; i < cnt; i++) {
+                    try {
+                        var tab = tl.getTabAt(i);
+                        if (!tab) continue;
+                        var txt = '';
+                        try { txt = String(tab.getText()); } catch (e) {}
+                        if (txt.indexOf('已点') >= 0) { idx = i; break; }
+                    } catch (e) {}
+                }
+            }
+
+            if (idx >= 0) {
+                tl.selectTab(idx);
+                logi('切页签: TabLayout.selectTab(' + idx + ')');
+                return true;
+            }
+        }
+    } catch (e) {
+        loge('TabLayout 切换失败: ' + e);
+    }
+
+    return false;
+}
+
+/**
+ * 尝试执行延迟切换。
+ * 由 Ui.post 派发，避免主线程阻塞。
+ */
+function tryAutoSwitch() {
+    if (!CFG.autoSwitchToOrdered) return;
+    if (!pendingSwitch) return;
+    if (switchedThisOpen) return;
+
+    Ui.post(function () {
+        try {
+            if (!pendingSwitch || switchedThisOpen) return;
+
+            var ok = switchTab(FT3_ORDERED, 'play_list');
+            if (ok) {
+                switchedThisOpen = true;
+                pendingSwitch = false;
+                logi('★ 已自动切到「已点」');
+            } else {
+                d('切换未成功，等下次机会');
+            }
+        } catch (e) {
+            loge('tryAutoSwitch: ' + e);
+        }
+    });
+}
+
 /* ================= 注册 Hook ================= */
 var hooked = 0;
 
-// ⓪ 列表创建
+// ⓪ 列表创建（顺带补切「已点」）
 try {
     Hook.method(PLAYLIST_CLS, 'LIZLLL', [], function (ctx) {
         try {
             var rv = null;
             try { rv = ctx.this.getSelectedListRv(); } catch (e) {}
-            if (!rv) return;
-            listRv = rv; targetRv = rv; lastSig = '';
-            logi('★ 列表已创建，实例已记录');
+            if (rv) {
+                listRv = rv; targetRv = rv; lastSig = '';
+                logi('★ 列表已创建，实例已记录');
+            }
+            // 面板已打开，是切页签的好时机
+            if (pendingSwitch && !switchedThisOpen) {
+                Ui.post(function () { Ui.post(function () { tryAutoSwitch(); }); });
+            }
         } catch (e) { loge('LIZLLL: ' + e); }
     }, 'after');
     hooked++;
@@ -910,6 +1037,66 @@ try {
     logi('Hook OK: Fragment.onResume（zeq 兜底）');
 } catch (e) { logw('Hook Fragment.onResume 跳过'); }
 
+// ⑥ 记录 BaseFirstLevelTabManager 实例（页签切换的执行者）
+//    hook LIZ 的 before，任何调用都会带上 this
+try {
+    Hook.method('com.bytedance.android.livesdk.ktvimpl.base.karaokestation.BaseFirstLevelTabManager',
+        'LIZ', ['int', 'java.lang.String'], function (ctx) {
+            try {
+                if (!tabManager) {
+                    tabManager = ctx.this;
+                    logi('已捕获 TabManager 实例');
+                }
+            } catch (e) {}
+        }, 'before');
+    hooked++;
+    logi('Hook OK: BaseFirstLevelTabManager.LIZ');
+} catch (e) { logw('Hook TabManager.LIZ 跳过: ' + e); }
+
+// ⑦ 监听「点歌」按钮(eas)的点击
+//    它属于 RealTimeChorusOperateView，点击由外部处理，
+//    所以直接 hook 它的 onTouchEvent 判断 ACTION_UP
+try {
+    Hook.method('com.bytedance.android.livesdk.ktvimpl.realtimechorus.RealTimeChorusOperateView',
+        'onTouchEvent', ['android.view.MotionEvent'], function (ctx) {
+            try {
+                var ev = ctx.args[0];
+                if (!ev) return;
+                var act = -1;
+                try { act = ev.getActionMasked(); } catch (e) {
+                    try { act = ev.getAction(); } catch (e2) {}
+                }
+                // ACTION_UP = 1
+                if (act === 1) {
+                    pendingSwitch = true;
+                    switchedThisOpen = false;
+                    d('检测到合唱面板点击，准备切「已点」');
+                }
+            } catch (e) {}
+        }, 'after');
+    hooked++;
+    logi('Hook OK: RealTimeChorusOperateView.onTouchEvent');
+} catch (e) { logw('Hook onTouchEvent 跳过: ' + e); }
+
+// ⑧ 页签就绪时执行切换
+//    BaseFirstLevelTabManager.LJIILJJIL(FrameLayout) 是页签容器初始化完的时机
+try {
+    Hook.method('com.bytedance.android.livesdk.ktvimpl.base.karaokestation.BaseFirstLevelTabManager',
+        'LJIILJJIL', ['android.widget.FrameLayout'], function (ctx) {
+            try {
+                tabManager = ctx.this;
+                if (pendingSwitch && !switchedThisOpen) {
+                    // 布局刚完成，等一帧再切
+                    Ui.post(function () {
+                        Ui.post(function () { tryAutoSwitch(); });
+                    });
+                }
+            } catch (e) {}
+        }, 'after');
+    hooked++;
+    logi('Hook OK: BaseFirstLevelTabManager.LJIILJJIL（页签就绪）');
+} catch (e) { logw('Hook LJIILJJIL 跳过: ' + e); }
+
 logi('=== 加载完成：' + hooked + ' 个 Hook ===');
 
 /* ================= 手动诊断 ================= */
@@ -942,4 +1129,46 @@ function forceProbe() {
     logw('已重置 probe 标记，下次 LIZJ 会重新诊断');
 }
 
-log('提示: show() 看采集 / dumpFirst() 看可见项 / forceProbe() 重新诊断');
+/** 手动测试：立即切到「已点」 */
+function testSwitchOrdered() {
+    log('手动测试切换页签…');
+    if (!tabManager) { logw('还没捕获 TabManager，先打开一次点歌面板'); }
+    var ok = switchTab(FT3_ORDERED, 'play_list');
+    log(ok ? '✓ 切换调用成功' : '✗ 切换失败，看上面的错误');
+}
+
+/** 手动测试：切到「点歌」 */
+function testSwitchOrder() {
+    var ok = switchTab(FT3_ORDER, '');
+    log(ok ? '✓ 已切到点歌' : '✗ 切换失败');
+}
+
+/** 打印页签状态 */
+function dumpTabs() {
+    Ui.post(function () {
+        try {
+            log('tabManager: ' + (tabManager ? '已捕获' : '未捕获'));
+            log('pendingSwitch=' + pendingSwitch + ' switched=' + switchedThisOpen);
+            if (!tabManager) return;
+
+            var tl = null;
+            try { tl = tabManager.l; } catch (e) {}
+            if (!tl) { logw('TabLayout 字段 l 读不到'); return; }
+
+            var cnt = 0;
+            try { cnt = tl.getTabCount(); } catch (e) {}
+            log('TabLayout 共 ' + cnt + ' 个 tab:');
+            for (var i = 0; i < cnt; i++) {
+                try {
+                    var t = tl.getTabAt(i);
+                    if (!t) continue;
+                    var txt = '';
+                    try { txt = String(t.getText()); } catch (e) {}
+                    log('  [' + i + '] "' + txt + '"');
+                } catch (e) {}
+            }
+        } catch (e) { loge('dumpTabs: ' + e); }
+    });
+}
+
+log('提示: show() / dumpFirst() / forceProbe() / testSwitchOrdered() / dumpTabs()');
