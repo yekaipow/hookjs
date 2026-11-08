@@ -18,7 +18,7 @@
  * ══════════════════════════════════════════════════════
  */
 
-var BUILD = 'v9.3-handler';
+var BUILD = 'v9.4-active';
 var CFG = {
     /**
      * 'probe' = 只诊断（默认）：打印元素结构，不碰 UI、不下载
@@ -1859,22 +1859,78 @@ function tryAutoSwitch() {
 /* ================= 注册 Hook ================= */
 var hooked = 0;
 
-// ⓪ 列表创建（顺带补切「已点」）
+// ⓪ 列表创建 —— 这是最早的主动获取点
+//
+// PlayListContainerView 里字段 d 就是 List<MusicPanel>（反编译确认），
+// 拿到容器实例就能直接读 d，不必等 LIZJ 回调。
+// 同时这里 setAdapter 刚完成，是注入按钮的好时机。
 try {
     Hook.method(PLAYLIST_CLS, 'LIZLLL', [], function (ctx) {
         try {
+            var self = ctx.this;
+
+            // ① 拿 RecyclerView
             var rv = null;
-            try { rv = ctx.this.getSelectedListRv(); } catch (e) {}
+            try { rv = self.getSelectedListRv(); } catch (e) {}
             if (rv) {
                 listRv = rv; targetRv = rv; lastSig = '';
                 logi('★ 列表已创建，实例已记录');
             }
-            // 面板已打开，标记待切（不在此调用 Ui）
+
+            // ② ★ 主动读取 List<MusicPanel>
+            //    容器字段 d 就是这个列表（反编译确认）
+            var list = null;
+            try {
+                list = self.$get ? self.$get('d') : null;
+            } catch (e) {}
+            if (!list) {
+                try { list = self.d; } catch (e) {}
+            }
+
+            // 三条路拿列表
+            if (!list) {
+                // ②-2 getAdapter().getItems()
+                try {
+                    var ad = self.getAdapter();
+                    if (ad) {
+                        try { list = ad.getItems(); } catch (e) {}
+                        if (!list) { try { list = ad.$get('items'); } catch (e) {} }
+                        if (list) d('从 adapter 取到列表');
+                    }
+                } catch (e) {}
+            }
+            if (!list && rv) {
+                // ②-3 RecyclerView.getAdapter().getItems()
+                try {
+                    var ad2 = rv.getAdapter();
+                    if (ad2) {
+                        try { list = ad2.getItems(); } catch (e) {}
+                        if (!list) { try { list = ad2.$get('items'); } catch (e) {} }
+                    }
+                } catch (e) {}
+            }
+
+            if (list) {
+                var n = listLen(list);
+                logi('★ 主动读到列表，长度 ' + n);
+                if (n > 0) {
+                    collectAll(list);
+                    needRefresh = true;
+                }
+            } else {
+                d('三条路都没拿到列表，等 LIZJ');
+            }
+
+            // ③ 面板已打开，标记待处理
+            if (triggerHost && !triggerMounted) needMountTrigger = true;
             if (pendingSwitch && !switchedThisOpen) needSwitchTab = true;
+
+            flushPending();
+
         } catch (e) { loge('LIZLLL: ' + e); }
     }, 'after');
     hooked++;
-    logi('Hook OK: LIZLLL');
+    logi('Hook OK: LIZLLL（创建即采集）');
 } catch (e) { loge('Hook LIZLLL 失败: ' + e); }
 
 // ① 数据更新
